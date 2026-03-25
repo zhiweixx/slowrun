@@ -1,10 +1,16 @@
 """
 Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
-Made for the Tiny Track of the NanoGPT Slowrun benchmark.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 tiny/train.py
+   torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"
+   Performance reference (8×H100, 12 epochs, alternating-14 layout):
+      Config: --gdn-layers 1,3,5,6,8,10,11,13,15,16,18,20,22,23 (14 GDN / 16 softmax)
+      Val loss: 3.2458 (baseline 3.2526, Δ = −0.0068)
+      Val BPB:  1.0548 (baseline 1.0570)
+      Training time: 80.78 min (baseline 58.51 min, +38%)
+      Wall time: 85.77 min
+      Per-layer GDN cost: ~42 ms/step (unoptimised, with conv)
 """
 
 import os
@@ -25,9 +31,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
 import wandb
-import numpy as np
-
 import tiktoken
+
+# Gated Delta Net kernels (flash-linear-attention)
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 _script_start = time.time()
 
@@ -36,37 +43,44 @@ _script_start = time.time()
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=32)
-parser.add_argument("--num-epochs", type=int, default=16)
+parser.add_argument("--device-batch-size", type=int, default=4)
+parser.add_argument("--num-epochs", type=int, default=12) 
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
-parser.add_argument("--scalar-lr", type=float, default=0.25)
+parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
-parser.add_argument("--embedding-lr", type=float, default=0.15)
-parser.add_argument("--unembedding-lr", type=float, default=0.001)
-parser.add_argument("--weight-decay", type=float, default=0.8)
-# WD follows a 3-phase schedule: hold → decay → ramp
-#   [0, wd-phase1-epoch]:          hold at --weight-decay
-#   [wd-phase1-epoch, wd-phase2-epoch]: decay to --wd-mid
-#   [wd-phase2-epoch, num-epochs]:      ramp up to --wd-end
-parser.add_argument("--wd-phase1-epoch", type=int, default=2)
-parser.add_argument("--wd-phase2-epoch", type=int, default=8)
-parser.add_argument("--wd-mid", type=float, default=0.1)
-parser.add_argument("--wd-end", type=float, default=1.25)
-parser.add_argument("--warmdown-ratio", type=float, default=0.6)
+parser.add_argument("--weight-decay", type=float, default=1.3)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n_layer", type=int, default=16)
-parser.add_argument("--n_head", type=int, default=8)
-parser.add_argument("--n_embd", type=int, default=1024)
-parser.add_argument("--lr_multiplier", type=float, default=1.0)
+parser.add_argument("--n_layer", type=int, default=30)
+parser.add_argument("--n_head", type=int, default=14)
+parser.add_argument("--n_embd", type=int, default=1792)
+parser.add_argument("--lr_multiplier", type=float, default=0.25)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--update-ema-every", type=int, default=10)
-parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
+parser.add_argument("--dupe-start-epoch", type=int, default=7,
+                    help="Epoch to enable layer duplication")
+parser.add_argument("--dupe-layers-start", type=int, default=15,
+                    help="First decoder layer to duplicate (inclusive)")
+parser.add_argument("--dupe-layers-end", type=int, default=21,
+                    help="Last decoder layer to duplicate (exclusive)")
+parser.add_argument("--dupe-loops", type=int, default=2,
+                    help="Number of extra replay passes through dupe layers")
+parser.add_argument("--warmdown-ratio", type=float, default=None,
+                    help="Override warmdown ratio (default 0.4)")
+parser.add_argument("--ema-decays", type=str, default="0.95",
+                    help="Comma-separated EMA decay rates, e.g. '0.999,0.9995,0.9998'")
+parser.add_argument("--ema-start-frac", type=float, default=0.90,
+                    help="Fraction of training after which to start EMA tracking")
+parser.add_argument("--checkpoint-avg", type=int, default=0,
+                    help="Number of late checkpoints to average (0=disabled)")
+parser.add_argument("--logit-cap", type=float, default=10.0,
+                    help="Logit soft-capping value (0=disabled)")
+parser.add_argument("--gdn-layers", type=str, default="auto",
+                    help="Comma-separated layer indices for GatedDeltaNet, or 'auto' for all-but-first-last-every-7th, or 'none'")
 args = parser.parse_args()
 
 # Resolve output path
@@ -74,10 +88,10 @@ if args.output_json and not args.save_result:
     args.save_result = args.output_json
 
 # =============================================================================
-# Hyperparameters
+# Hardwired d12 (GPT-2 small) hyperparameters
 # =============================================================================
 
-# Architecture
+# Architecture (defaults = d12 GPT-2 small)
 DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
@@ -91,8 +105,8 @@ DATA_DIR = "fineweb_data"
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
 BASE_SCALAR_LR = args.scalar_lr
-BASE_EMBEDDING_LR = args.embedding_lr
-BASE_UNEMBEDDING_LR = args.unembedding_lr
+BASE_EMBEDDING_LR = 0.15
+BASE_UNEMBEDDING_LR = 0.002
 
 # Apply LR multiplier if provided (scales all LRs uniformly)
 _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
@@ -104,8 +118,9 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = args.warmdown_ratio
+WARMDOWN_RATIO = args.warmdown_ratio if args.warmdown_ratio is not None else 0.2
 FINAL_LR_FRAC = 0.0
+LOGIT_CAP = args.logit_cap
 
 # =============================================================================
 # Utilities
@@ -126,7 +141,50 @@ class DummyWandb:
     def finish(self): pass
 
 # =============================================================================
-# Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
+# EMA (Exponential Moving Average) for weight averaging
+# =============================================================================
+
+class EMATracker:
+    """Maintains EMA shadow weights on CPU for memory efficiency."""
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {name: p.data.float().cpu().clone() for name, p in model.named_parameters()}
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        d = self.decay
+        for name, p in model.named_parameters():
+            self.shadow[name].lerp_(p.data.float().cpu(), 1 - d)
+
+    def apply_to(self, model):
+        """Copy EMA weights into model (for evaluation)."""
+        for name, p in model.named_parameters():
+            p.data.copy_(self.shadow[name].to(p.device, dtype=p.dtype))
+
+    def state_dict(self):
+        return dict(self.shadow)
+
+
+def average_checkpoints(checkpoints):
+    """Average a list of state_dicts (on CPU)."""
+    avg = {}
+    n = len(checkpoints)
+    for key in checkpoints[0]:
+        stacked = torch.stack([ckpt[key].float() for ckpt in checkpoints])
+        avg[key] = stacked.mean(dim=0)
+    return avg
+
+
+def load_state_dict_into_model(model, state_dict):
+    """Load a state dict into model, handling dtype conversion."""
+    for name, p in model.named_parameters():
+        if name in state_dict:
+            p.data.copy_(state_dict[name].to(p.device, dtype=p.dtype))
+
+# =============================================================================
+# Flash Attention (FA3 on Hopper)
 # =============================================================================
 
 def _load_fa3():
@@ -144,32 +202,9 @@ def _load_fa3():
 
 _fa3 = _load_fa3()
 
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
-    Tq, Tk = q.size(2), k.size(2)
-    window = window_size[0]
-    if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-    if Tq == 1:
-        if window >= 0 and window < Tk:
-            start = max(0, Tk - (window + 1))
-            k, v = k[:, :, start:, :], v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
-    device = q.device
-    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
-    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-    mask = col_idx <= row_idx
-    if window >= 0 and window < Tk:
-        mask = mask & ((row_idx - col_idx) <= window)
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
-
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Flash Attention for training. q,k,v: (B, T, H, D)."""
-    if _fa3 is not None:
-        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
-    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-    enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
-    return y.transpose(1, 2)
+    """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
+    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
@@ -180,13 +215,14 @@ flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 @dataclass
 class GPTConfig:
     sequence_len: int = MAX_SEQ_LEN
-    vocab_size: int = 32768
+    vocab_size: int = 50257
     n_layer: int = DEPTH
     n_head: int = N_HEAD
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
-    dropout: float = 0.1
+    dropout: float = 0.0
+    gdn_layers: list = None  # layer indices that use GatedDeltaNet (None = all softmax)
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -216,13 +252,9 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-        # Per-head attention gate: enables context-based attention no-op
+        # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # Determine if this is a long-window layer for partial key offset
-        pattern = config.window_pattern.upper()
-        char = pattern[layer_idx % len(pattern)]
-        self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -237,14 +269,114 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        # Partial key offset: shift stationary dims forward by 1 on long-window layers
-        if self.use_key_offset and T > 1:
-            k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
+        # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
+
+class GatedDeltaNetAttention(nn.Module):
+    """Gated Delta Net linear attention with negative eigenvalues.
+    Paper: https://arxiv.org/abs/2412.06464
+    Uses Mamba2-style forget gate + delta rule with beta in [0,2].
+    Param-matched to standard attention: ~4*d^2 per layer.
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.num_heads = config.n_head
+        self.head_k_dim = config.n_embd // config.n_head // 2  # 64 for d=1792, h=14
+        self.head_v_dim = config.n_embd // config.n_head        # 128 for d=1792, h=14
+        self.key_dim = self.num_heads * self.head_k_dim          # 896
+        self.value_dim = self.num_heads * self.head_v_dim        # 1792
+        self.layer_idx = layer_idx
+
+        # Projections (~4*d^2 total)
+        self.q_proj = nn.Linear(config.n_embd, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(config.n_embd, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(config.n_embd, self.value_dim, bias=False)
+        self.g_proj = nn.Linear(config.n_embd, self.value_dim, bias=False)  # output gate
+        self.o_proj = nn.Linear(self.value_dim, config.n_embd, bias=False)
+
+        # Delta rule: beta (write strength) and forget gate projections
+        self.a_proj = nn.Linear(config.n_embd, self.num_heads, bias=False)  # forget gate input
+        self.b_proj = nn.Linear(config.n_embd, self.num_heads, bias=True)   # beta input (bias=True like NVlabs ref)
+
+        # Per-head beta bias for eigenvalue diversity: half heads start β<1 (accumulation),
+        # half start β>1 (state-tracking via negative eigenvalues)
+        # linspace(-1.5, 1.5) → sigmoid gives β*2 ∈ [0.36, 1.64] at init
+        nn.init.zeros_(self.b_proj.bias)  # will be re-initialized in init_weights
+        self.beta_bias = nn.Parameter(torch.linspace(-1.5, 1.5, self.num_heads))
+        self.beta_bias._no_weight_decay = True
+
+        # Mamba2-style A and dt parameters for forget gate
+        # Tighter range [2, 8] prevents memoryless heads (original [0,16] too wide)
+        A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(2, 8)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(
+            torch.rand(self.num_heads) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        # Short 1D convolutions on q, k, v (size 4, crucial for performance)
+        self.conv_size = 4
+        self.q_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
+                               padding=self.conv_size - 1, groups=self.key_dim, bias=False)
+        self.k_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
+                               padding=self.conv_size - 1, groups=self.key_dim, bias=False)
+        self.v_conv = nn.Conv1d(self.value_dim, self.value_dim, self.conv_size,
+                               padding=self.conv_size - 1, groups=self.value_dim, bias=False)
+
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x, ve, cos_sin, window_size):
+        B, T, C = x.size()
+
+        # Project q, k, v
+        q = self.q_proj(x)  # (B, T, key_dim)
+        k = self.k_proj(x)  # (B, T, key_dim)
+        v = self.v_proj(x)  # (B, T, value_dim)
+
+        # Short convolutions + SiLU activation
+        q = F.silu(self.q_conv(q.transpose(1, 2))[:, :, :T].transpose(1, 2))
+        k = F.silu(self.k_conv(k.transpose(1, 2))[:, :, :T].transpose(1, 2))
+        v = F.silu(self.v_conv(v.transpose(1, 2))[:, :, :T].transpose(1, 2))
+
+        # Reshape to heads
+        q = q.view(B, T, self.num_heads, self.head_k_dim)
+        k = k.view(B, T, self.num_heads, self.head_k_dim)
+        v = v.view(B, T, self.num_heads, self.head_v_dim)
+
+        # Beta: write strength with negative eigenvalues (beta in [0, 2])
+        # beta_bias creates structural diversity: some heads accumulate (β<1),
+        # others do state-tracking via sign-flipping (β>1)
+        beta = (self.b_proj(x) + self.beta_bias).sigmoid() * 2.0  # (B, T, H)
+
+        # Forget gate (Mamba2-style, in log-space, always negative)
+        g = -self.A_log.float().exp() * F.softplus(
+            self.a_proj(x).float() + self.dt_bias
+        )  # (B, T, H)
+
+        # Chunk-wise delta rule kernel
+        o, _ = chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g.to(q.dtype), beta=beta.to(q.dtype),
+            scale=self.head_k_dim ** -0.5,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )  # (B, T, H, head_v_dim)
+
+        # Output gate: gated RMSNorm
+        g_out = self.g_proj(x).view(B, T, self.num_heads, self.head_v_dim)
+        o = F.rms_norm(o, (self.head_v_dim,)) * F.silu(g_out)
+
+        o = o.reshape(B, T, self.value_dim)
+        return self.resid_dropout(self.o_proj(o))
 
 
 class MLP(nn.Module):
@@ -254,15 +386,19 @@ class MLP(nn.Module):
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
-
+        return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.is_gdn = config.gdn_layers is not None and layer_idx in config.gdn_layers
+        if self.is_gdn:
+            self.attn = GatedDeltaNetAttention(config, layer_idx)
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
@@ -288,7 +424,11 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.ve_projs = nn.ModuleDict({
+            str(i): nn.Linear(config.n_embd, kv_dim, bias=False)
+            for i in range(config.n_layer)
+            if has_ve(i, config.n_layer) and (config.gdn_layers is None or i not in config.gdn_layers)
+        })
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
@@ -296,6 +436,14 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self._dupe_layers = None  # (start, end) or None
+
+    def set_dupe_layers(self, start, end, loops=2):
+        assert start >= self.encoder_layers, "dupe layers must be decoder-only"
+        assert end <= self.config.n_layer
+        self._dupe_layers = (start, end)
+        self._dupe_loops = loops
+        print0(f"Dupe layers {start}-{end-1}: {loops} extra replays ({loops+1} total passes)")
 
     @torch.no_grad()
     def init_weights(self):
@@ -303,22 +451,47 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            if block.is_gdn:
+                # GatedDeltaNet init
+                attn = block.attn
+                torch.nn.init.uniform_(attn.q_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.k_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.v_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.g_proj.weight, -s, s)
+                torch.nn.init.zeros_(attn.o_proj.weight)
+                torch.nn.init.uniform_(attn.a_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.b_proj.weight, -s, s)
+                torch.nn.init.zeros_(attn.b_proj.bias)
+                # Beta bias: structural diversity for negative eigenvalues
+                # Half heads start with β<1 (accumulation), half with β>1 (state-tracking)
+                attn.beta_bias.copy_(torch.linspace(-1.5, 1.5, attn.num_heads))
+                # A_log and dt_bias: tighter range [2, 8] prevents memoryless heads
+                attn.A_log.copy_(torch.empty_like(attn.A_log).uniform_(2, 8).log())
+                dt = torch.exp(
+                    torch.rand_like(attn.dt_bias) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+                ).clamp(min=1e-4)
+                attn.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+                # Conv weights: normal init
+                for conv in [attn.q_conv, attn.k_conv, attn.v_conv]:
+                    torch.nn.init.normal_(conv.weight, std=0.02)
+            else:
+                # Standard attention init
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-
-        self.resid_lambdas.fill_(1.1)
+        self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            if not block.is_gdn:
+                if block.attn.ve_gate is not None:
+                    torch.nn.init.zeros_(block.attn.ve_gate.weight)
+                torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -328,11 +501,7 @@ class GPT(nn.Module):
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
         device = self.transformer.wte.weight.device
-        # Half-truncated RoPE: only rotate half the dims, leave the rest stationary
-        half = head_dim // 4  # number of frequency pairs for the rotated half
-        inv_freq = 1.0 / (base ** (torch.arange(0, half * 2, 2, dtype=torch.float32, device=device) / (half * 2)))
-        # Pad with zeros for the stationary half
-        inv_freq = torch.cat([inv_freq, torch.zeros(head_dim // 2 - half, dtype=torch.float32, device=device)])
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
@@ -348,32 +517,36 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
-        
-    def _avg_causal_attended_keys(self, window, seq_len):
-        if window < 0 or window >= seq_len - 1:
-            return (seq_len + 1) / 2
-        max_keys = min(window + 1, seq_len)
-        return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embedding lookup + elementwise scalars
-        nparams_exclude = (self.transformer.wte.weight.numel()
-                          + self.resid_lambdas.numel()
-                          + self.x0_lambdas.numel()
-                          + self.skip_weights.numel())
+        ve_numel = sum(p.weight.numel() for p in self.ve_projs.values())
+        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
-        attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
-        attn_gate_ids = {id(p) for p in attn_gate_params}
-        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
+        # Collect GDN scalar params (A_log, dt_bias, conv weights) separately
+        gdn_scalar_ids = set()
+        gdn_scalar_params = []
+        for block in self.transformer.h:
+            if block.is_gdn:
+                for p in [block.attn.A_log, block.attn.dt_bias, block.attn.beta_bias]:
+                    gdn_scalar_ids.add(id(p))
+                    gdn_scalar_params.append(p)
+                # b_proj bias is a tiny 1D vector — treat as scalar, not matrix
+                if block.attn.b_proj.bias is not None:
+                    gdn_scalar_ids.add(id(block.attn.b_proj.bias))
+                    gdn_scalar_params.append(block.attn.b_proj.bias)
+                for conv in [block.attn.q_conv, block.attn.k_conv, block.attn.v_conv]:
+                    for p in conv.parameters():
+                        gdn_scalar_ids.add(id(p))
+                        gdn_scalar_params.append(p)
+        matrix_params = [p for p in list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+                         if id(p) not in gdn_scalar_ids]
+        ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -383,11 +556,15 @@ class GPT(nn.Module):
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
+        # GDN scalar params: use Adam with no weight decay (A_log, dt_bias have _no_weight_decay)
+        if gdn_scalar_params:
+            param_groups.append(dict(kind='adamw', params=gdn_scalar_params, lr=SCALAR_LR,
+                                     betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -398,26 +575,55 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+        """Run decoder layers [start, end), with U-Net skip connections."""
+        for i in range(start, end):
+            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
+            j = self.config.n_layer - 1 - i
+            if 0 <= j < self.encoder_layers:
+                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+        return x
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
-        skip_connections = []
-        for i, block in enumerate(self.transformer.h):
-            if i >= self.encoder_layers and skip_connections:
-                skip = skip_connections.pop()
-                x = x + self.skip_weights[i - self.encoder_layers] * skip
+
+        # Encoder half: run layers and collect outputs for skip connections
+        encoder_outputs = []
+        for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-            if i < self.encoder_layers:
-                skip_connections.append(x)
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            encoder_outputs.append(x)
+
+        # Decoder half
+        dupe = self._dupe_layers
+        if dupe is None:
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer)
+        else:
+            # First pass: encoder boundary through end of dupe range
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, dupe[1])
+            # Extra replays through dupe range
+            for _ in range(self._dupe_loops):
+                x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                            dupe[0], dupe[1])
+            # Remaining decoder layers
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[1], self.config.n_layer)
+
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # softcap
+        logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                ignore_index=-1, reduction=loss_reduction)
         return logits
 
 # =============================================================================
@@ -477,7 +683,6 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
-
 
 class DistMuonAdamW(torch.optim.Optimizer):
     """Distributed MuonAdamW with ZeRO-2 style sharding."""
@@ -723,7 +928,7 @@ if device_type == "cuda":
 if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
-    print0("Using PyTorch SDPA fallback (no FA3)")
+    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
@@ -760,8 +965,26 @@ for i in range(vocab_size):
         token_bytes_list.append(len(encoder.decode_single_token_bytes(i)))
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
+# Parse GDN layer indices
+gdn_layer_indices = None
+if args.gdn_layers == 'none':
+    gdn_layer_indices = None
+elif args.gdn_layers == 'auto':
+    # Hybrid: softmax on layers 0, 7, 14, 21, 29 (first, every 7th, last)
+    # GDN on everything else (25 out of 30 layers)
+    softmax_layers = set([0, 7, 14, 21, DEPTH - 1])
+    gdn_layer_indices = [i for i in range(DEPTH) if i not in softmax_layers]
+else:
+    gdn_layer_indices = [int(x.strip()) for x in args.gdn_layers.split(',') if x.strip()]
+
+if gdn_layer_indices:
+    print0(f"GatedDeltaNet layers ({len(gdn_layer_indices)}): {gdn_layer_indices}")
+    print0(f"Softmax attention layers ({DEPTH - len(gdn_layer_indices)}): {[i for i in range(DEPTH) if i not in gdn_layer_indices]}")
+else:
+    print0("All layers use standard softmax attention (no GDN)")
+
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, gdn_layers=gdn_layer_indices)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -796,9 +1019,6 @@ tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
-# Convert epoch boundaries to steps (must happen after num_iterations is known)
-wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
-wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
@@ -823,12 +1043,22 @@ min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
+timed_steps = 0
+timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
-steps_per_epoch = num_iterations / args.num_epochs
-param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
-ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
+dupe_active = False
 
-wall_clock_start = time.time()
+# EMA and checkpoint averaging setup
+ema_decays = [float(d) for d in args.ema_decays.split(",") if d.strip()] if args.ema_decays else []
+ema_start_step = round(args.ema_start_frac * num_iterations)
+ema_trackers = []  # initialized lazily at ema_start_step
+ema_initialized = False
+late_checkpoints = []  # list of state_dicts (on CPU) for checkpoint averaging
+checkpoint_avg_count = args.checkpoint_avg
+if ema_decays:
+    print0(f"EMA decays: {ema_decays}, starting at step {ema_start_step} ({args.ema_start_frac*100:.0f}% of training)")
+if checkpoint_avg_count > 0:
+    print0(f"Checkpoint averaging: will keep last {checkpoint_avg_count} epoch checkpoints")
 
 # Initial val evaluation
 model.eval()
@@ -842,6 +1072,15 @@ min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
+    if not dupe_active and current_epoch >= args.dupe_start_epoch:
+        print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
+        orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
+        model = torch.compile(orig_model, dynamic=False)
+        # model = orig_model # replace compile with this line for eager mode
+        dupe_active = True
+        timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
+        gc.enable(); gc.collect()
+
     # Training step
     synchronize()
     t0 = time.time()
@@ -854,32 +1093,26 @@ while current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
-    # WD schedule:
-    #   [0, wd_phase1_end_step]:              hold at weight_decay
-    #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
-    #   [wd_phase2_end_step, num_iterations]:     ramp up to wd_end
-    wd = np.interp(step,
-        [0, wd_phase1_end_step, wd_phase2_end_step, num_iterations],
-        [args.weight_decay, args.weight_decay, args.wd_mid, args.wd_end])
-    # Convert to a scale factor;
-    # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
-    wd_scale = wd / args.weight_decay if args.weight_decay > 0 else 0.0
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if "initial_wd" not in group:
-            group["initial_wd"] = group.get("weight_decay", 0.0)
-        group["weight_decay"] = group["initial_wd"] * wd_scale
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
-    if ema_params is not None and step % args.update_ema_every == 0:
-        torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
 
     step += 1
+
+    # EMA update (every 10 steps to minimize CPU copy overhead)
+    if ema_decays and step >= ema_start_step and step % 10 == 0:
+        if not ema_initialized:
+            print0(f"Initializing {len(ema_decays)} EMA tracker(s) at step {step}")
+            ema_trackers = [EMATracker(orig_model, d) for d in ema_decays]
+            ema_initialized = True
+        for ema in ema_trackers:
+            ema.update(orig_model)
 
     # Logging
     ema_beta = 0.9
@@ -888,11 +1121,12 @@ while current_epoch <= args.num_epochs:
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
-    if step > 3:
+    if step >= timing_start_step:
         total_training_time += dt
-    steps_done = step - 3
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+        timed_steps += 1
+    eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
+    dupe_str = " [DUPE]" if dupe_active else ""
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
@@ -919,36 +1153,71 @@ while current_epoch <= args.num_epochs:
             if args.patience >= 0 and epochs_without_improvement >= args.patience:
                 print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
                 break
+        # Save checkpoint for late averaging
+        if checkpoint_avg_count > 0 and step >= ema_start_step:
+            ckpt = {name: p.data.float().cpu().clone() for name, p in orig_model.named_parameters()}
+            late_checkpoints.append(ckpt)
+            if len(late_checkpoints) > checkpoint_avg_count:
+                late_checkpoints.pop(0)
+            print0(f"  Saved checkpoint for averaging ({len(late_checkpoints)}/{checkpoint_avg_count})")
+
         model.train()
+        # Update num_iterations estimate now that we know real steps per epoch
+        # steps_per_epoch = step // current_epoch
+        # num_iterations = steps_per_epoch * args.num_epochs
+        # print0(f"Epoch {current_epoch} took {steps_per_epoch} steps. Updated estimate: {num_iterations} total steps.")
         current_epoch = epoch
 
     # GC management
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
 
-# Final EMA evaluation
-if ema_params is not None:
-    ema_updates = step // args.update_ema_every
-    if ema_updates > 0:
-        correction = 1.0 / (1.0 - param_ema_beta ** ema_updates)
-        model.eval()
-        with torch.no_grad():
-            for p, ema in zip(model.parameters(), ema_params):
-                p.copy_(ema * correction)
-        val_loader = build_val_loader()
-        with autocast_ctx:
-            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
-        val_bpb = ema_bpb
-        val_loss = ema_loss
-        if ema_bpb < min_val_bpb:
-            min_val_bpb = ema_bpb
-            min_val_loss = ema_loss
+# =============================================================================
+# Post-training: evaluate EMA and checkpoint averages
+# =============================================================================
+
+# Save the original (final) model weights so we can restore after EMA eval
+if ema_trackers or late_checkpoints:
+    final_weights = {name: p.data.clone() for name, p in orig_model.named_parameters()}
+
+# Evaluate EMA blend (single best ratio for speed)
+for i, ema in enumerate(ema_trackers):
+    print0(f"\n--- Evaluating EMA blend (decay={ema.decay}, {ema.num_updates} updates) ---")
+    alpha = 0.7  # best from sweep: 0.7*final + 0.3*EMA
+    for name, p in orig_model.named_parameters():
+        blended = alpha * final_weights[name] + (1 - alpha) * ema.shadow[name].to(final_weights[name].device, dtype=final_weights[name].dtype)
+        p.data.copy_(blended.to(p.device, dtype=p.dtype))
+    blend_model = torch.compile(orig_model, dynamic=False)
+    blend_model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        blend_bpb, blend_loss = evaluate_bpb(blend_model, val_loader, eval_steps, token_bytes)
+    print0(f"Blend({alpha:.1f}*final+{1-alpha:.1f}*EMA {ema.decay}): Val BPB: {blend_bpb:.6f} | Val Loss: {blend_loss:.6f}")
+    if blend_loss < min_val_loss:
+        min_val_loss = blend_loss
+        min_val_bpb = blend_bpb
+        print0(f"  ** New best! (from blend {alpha:.1f}/{1-alpha:.1f} with EMA {ema.decay})")
+    load_state_dict_into_model(orig_model, final_weights)
+
+# Evaluate checkpoint average
+if len(late_checkpoints) >= 2:
+    print0(f"\n--- Evaluating checkpoint average ({len(late_checkpoints)} checkpoints) ---")
+    avg_sd = average_checkpoints(late_checkpoints)
+    load_state_dict_into_model(orig_model, avg_sd)
+    avg_model = torch.compile(orig_model, dynamic=False)
+    avg_model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        avg_bpb, avg_loss = evaluate_bpb(avg_model, val_loader, eval_steps, token_bytes)
+    print0(f"Checkpoint avg: Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
+    if avg_loss < min_val_loss:
+        min_val_loss = avg_loss
+        min_val_bpb = avg_bpb
+        print0(f"  ** New best! (from checkpoint averaging)")
+    # Restore original weights
+    load_state_dict_into_model(orig_model, final_weights)
 
 # Summary
-wall_clock_time = time.time() - wall_clock_start
-print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
@@ -977,4 +1246,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-

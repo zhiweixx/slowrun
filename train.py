@@ -34,12 +34,12 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=12)
+parser.add_argument("--num-epochs", type=int, default=12) 
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
-parser.add_argument("--weight-decay", type=float, default=1.6)
+parser.add_argument("--weight-decay", type=float, default=1.3)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=30)
@@ -51,12 +51,27 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--dupe-start-epoch", type=int, default=10,
+parser.add_argument("--dupe-start-epoch", type=int, default=7,
                     help="Epoch to enable layer duplication")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
 parser.add_argument("--dupe-layers-end", type=int, default=21,
                     help="Last decoder layer to duplicate (exclusive)")
+parser.add_argument("--dupe-loops", type=int, default=2,
+                    help="Number of extra replay passes through dupe layers")
+parser.add_argument("--warmdown-ratio", type=float, default=None,
+                    help="Override warmdown ratio (default 0.4)")
+parser.add_argument("--logit-cap", type=float, default=10.0,
+                    help="Logit soft-capping value (0=disabled)")
+parser.add_argument("--logit-avg", type=int, default=3,
+                    help="Number of late checkpoints for logit (probability) averaging (0=disabled)")
+parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
+                    help="Directory to save/load epoch checkpoints for logit averaging")
+parser.add_argument("--logit-avg-mode", type=str, default="both",
+                    choices=["equal", "weighted", "both"],
+                    help="Weight scheme: equal, linear recency weighted, or compare both")
+parser.add_argument("--eval-logit-avg", action="store_true",
+                    help="Skip training and only run logit-avg eval on saved checkpoints")
 args = parser.parse_args()
 
 # Resolve output path
@@ -94,8 +109,9 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.2
+WARMDOWN_RATIO = args.warmdown_ratio if args.warmdown_ratio is not None else 0.2
 FINAL_LR_FRAC = 0.0
+LOGIT_CAP = args.logit_cap
 
 # =============================================================================
 # Utilities
@@ -114,6 +130,13 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+# =============================================================================
+def load_state_dict_into_model(model, state_dict):
+    """Load a state dict into model, handling dtype conversion."""
+    for name, p in model.named_parameters():
+        if name in state_dict:
+            p.data.copy_(state_dict[name].to(p.device, dtype=p.dtype))
 
 # =============================================================================
 # Flash Attention (FA3 on Hopper)
@@ -201,11 +224,6 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        # XSA: remove self-value projection from attention output (arXiv 2603.09078)
-        vn = F.normalize(v, dim=-1)
-        if self.n_kv_head != self.n_head:
-            vn = vn.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
-        y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -262,11 +280,12 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
 
-    def set_dupe_layers(self, start, end):
+    def set_dupe_layers(self, start, end, loops=2):
         assert start >= self.encoder_layers, "dupe layers must be decoder-only"
         assert end <= self.config.n_layer
         self._dupe_layers = (start, end)
-        print0(f"Dupe layers {start}-{end-1}: decoder layers repeated with skip connections")
+        self._dupe_loops = loops
+        print0(f"Dupe layers {start}-{end-1}: {loops} extra replays ({loops+1} total passes)")
 
     @torch.no_grad()
     def init_weights(self):
@@ -315,12 +334,22 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _avg_causal_attended_keys(self, window, seq_len):
+        if window < 0 or window >= seq_len - 1:
+            return (seq_len + 1) / 2
+        max_keys = min(window + 1, seq_len)
+        return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
+
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        ve_numel = sum(p.weight.numel() for p in self.ve_projs.values())
-        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        # Exclude non-matmul params: embedding lookup + elementwise scalars
+        nparams_exclude = (self.transformer.wte.weight.numel()
+                          + self.resid_lambdas.numel()
+                          + self.x0_lambdas.numel()
+                          + self.skip_weights.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
+        # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
+        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
@@ -386,19 +415,17 @@ class GPT(nn.Module):
             # First pass: encoder boundary through end of dupe range
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         self.encoder_layers, dupe[1])
-            # Replay 1: run dupe range again
-            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        dupe[0], dupe[1])
-            # Replay 2: run dupe range a third time
-            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        dupe[0], dupe[1])
+            # Extra replays through dupe range
+            for _ in range(self._dupe_loops):
+                x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                            dupe[0], dupe[1])
             # Remaining decoder layers
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         dupe[1], self.config.n_layer)
 
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)
+        logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
         if targets is not None:
             return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                 ignore_index=-1, reduction=loss_reduction)
@@ -637,7 +664,7 @@ class DataLoader:
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
-        
+
 # =============================================================================
 # Loss evaluation
 # =============================================================================
@@ -669,6 +696,74 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_loss, total_tokens = total_loss.item(), total_tokens.item()
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
+    return bpb, loss
+
+
+@torch.no_grad()
+def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
+    """Evaluate using probability averaging across checkpoints (proper ensemble).
+
+    Loads each checkpoint from disk once, runs all val batches for it, then
+    moves to the next — one CPU->GPU weight transfer per checkpoint, not per batch.
+    Accumulates running scalar totals instead of per-token tensors.
+    """
+    dev = orig_model.get_device()
+    V   = orig_model.config.vocab_size
+
+    # Pre-fetch all val batches to CPU (token ids, tiny ~10 MB)
+    val_loader = build_val_loader()
+    all_x, all_y = [], []
+    for _ in range(steps):
+        x, y, _ = next(val_loader)
+        all_x.append(x.cpu())
+        all_y.append(y.cpu())
+
+    BT = all_y[0].numel()
+
+    # Per-batch accumulated weighted target probs, kept on GPU
+    # Shape: (steps, BT) — only target-token probs, not full vocab
+    batch_target_probs = torch.zeros(steps, BT, dtype=torch.float32, device=dev)
+
+    # Checkpoint-outer, batch-inner: each checkpoint loaded exactly once
+    for path, w in zip(ckpt_paths, weights):
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        load_state_dict_into_model(orig_model, ckpt)
+        del ckpt
+        for i, (x, y) in enumerate(zip(all_x, all_y)):
+            y_flat = y.view(-1).to(dev)
+            with autocast_ctx:
+                logits = eval_model(x.to(dev))
+            probs = torch.softmax(logits.view(BT, V).float(), dim=-1)
+            tgt   = probs[torch.arange(BT, device=dev), y_flat.clamp_min(0)]
+            batch_target_probs[i].add_(tgt, alpha=w)
+
+    # Compute metrics from accumulated target probs using running totals
+    total_nats   = torch.tensor(0.0, dtype=torch.float64, device=dev)
+    total_bytes  = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_loss   = torch.tensor(0.0, dtype=torch.float64, device=dev)
+    total_tokens = torch.tensor(0, dtype=torch.int64, device=dev)
+
+    for i, y in enumerate(all_y):
+        y_flat = y.view(-1).to(dev)
+        mask = y_flat != -1
+        log_probs = batch_target_probs[i].clamp_min(1e-40).log()
+        num_bytes_batch = token_bytes[y_flat.clamp_min(0)]
+
+        total_nats   += (log_probs.neg() * (num_bytes_batch > 0)).sum().double()
+        total_bytes  += num_bytes_batch.sum()
+        total_loss   += log_probs[mask].neg().sum().double()
+        total_tokens += mask.sum()
+
+    del batch_target_probs
+
+    if dist.is_initialized():
+        dist.all_reduce(total_nats,   op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes,  op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss,   op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+
+    bpb  = total_nats.item()  / (math.log(2) * total_bytes.item())  if total_bytes.item()  > 0 else float('inf')
+    loss = total_loss.item()  / total_tokens.item()                  if total_tokens.item() > 0 else float('inf')
     return bpb, loss
 
 # =============================================================================
@@ -808,22 +903,32 @@ timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 dupe_active = False
 
-# Initial val evaluation
-model.eval()
-val_loader = build_val_loader()
-with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
-min_val_bpb = val_bpb
-min_val_loss = val_loss
-model.train()
+late_checkpoint_paths = []  # paths to saved epoch checkpoints for logit averaging
+logit_avg_count = args.logit_avg
+if logit_avg_count > 0 and master_process:
+    os.makedirs(args.logit_avg_dir, exist_ok=True)
+if logit_avg_count > 0:
+    print0(f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/")
 
-while current_epoch <= args.num_epochs:
+if args.eval_logit_avg:
+    print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
+else:
+    # Initial val evaluation
+    model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+    wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    min_val_bpb = val_bpb
+    min_val_loss = val_loss
+    model.train()
+
+while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     if not dupe_active and current_epoch >= args.dupe_start_epoch:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
-        orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
-        model = torch.compile(orig_model, dynamic=False) 
+        orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
+        model = torch.compile(orig_model, dynamic=False)
         # model = orig_model # replace compile with this line for eager mode
         dupe_active = True
         timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
@@ -892,6 +997,20 @@ while current_epoch <= args.num_epochs:
             if args.patience >= 0 and epochs_without_improvement >= args.patience:
                 print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
                 break
+        # Save checkpoint to disk for logit averaging
+        if logit_avg_count > 0:
+            ckpt_path = os.path.join(args.logit_avg_dir, f"epoch_{current_epoch:03d}.pt")
+            if master_process:
+                ckpt = {name: p.data.float().cpu() for name, p in orig_model.named_parameters()}
+                torch.save(ckpt, ckpt_path)
+                del ckpt
+            late_checkpoint_paths.append(ckpt_path)
+            if len(late_checkpoint_paths) > logit_avg_count:
+                old = late_checkpoint_paths.pop(0)
+                if master_process and os.path.exists(old):
+                    os.remove(old)
+            print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
+
         model.train()
         # Update num_iterations estimate now that we know real steps per epoch
         # steps_per_epoch = step // current_epoch
@@ -902,6 +1021,51 @@ while current_epoch <= args.num_epochs:
     # GC management
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
+
+# =============================================================================
+# Post-training: evaluate checkpoint averages
+# =============================================================================
+
+# Evaluate logit (probability) average
+if logit_avg_count > 0:
+    # In eval-only mode, discover checkpoints from disk; otherwise use what was saved during training
+    if args.eval_logit_avg:
+        import glob as _glob
+        all_disk = sorted(_glob.glob(os.path.join(args.logit_avg_dir, "epoch_*.pt")))
+        ckpt_paths_for_logit = all_disk[-logit_avg_count:]
+    else:
+        ckpt_paths_for_logit = late_checkpoint_paths
+
+    if len(ckpt_paths_for_logit) >= 2:
+        n = len(ckpt_paths_for_logit)
+        print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
+
+        la_model = torch.compile(orig_model, dynamic=False)
+        la_model.eval()
+
+        def _run_mode(label, weights):
+            print0(f"  [{label}] weights: {[f'{w:.3f}' for w in weights]}")
+            bpb, loss = evaluate_bpb_logit_avg(la_model, ckpt_paths_for_logit, weights, eval_steps)
+            print0(f"  [{label}] Val BPB: {bpb:.6f} | Val Loss: {loss:.6f}")
+            wandb_run.log({f"logit_avg_{label}/bpb": bpb, f"logit_avg_{label}/loss": loss})
+            return bpb, loss
+
+        equal_w    = [1.0 / n] * n
+        raw_w      = list(range(1, n + 1))
+        weighted_w = [w / sum(raw_w) for w in raw_w]
+
+        if args.logit_avg_mode in ("equal", "both"):
+            eq_bpb, eq_loss = _run_mode("equal", equal_w)
+            if eq_loss < min_val_loss:
+                min_val_loss, min_val_bpb = eq_loss, eq_bpb
+                print0(f"  ** New best! (logit avg equal weights)")
+
+        if args.logit_avg_mode in ("weighted", "both"):
+            wt_bpb, wt_loss = _run_mode("weighted", weighted_w)
+            if wt_loss < min_val_loss:
+                min_val_loss, min_val_bpb = wt_loss, wt_bpb
+                print0(f"  ** New best! (logit avg recency weights)")
+
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
