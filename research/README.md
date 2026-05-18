@@ -1,5 +1,5 @@
 
-# Dev
+# Research
 
 This is a home for submissions that do not beat any World Records yet, but are interesting and can beat the record with a bit more effort.
 

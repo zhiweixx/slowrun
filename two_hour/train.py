@@ -3,7 +3,7 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 train.py
+    torchrun --standalone --nproc_per_node=8 two_hour/train.py 
 """
 
 import os
@@ -12,15 +12,13 @@ import gc
 import math
 import time
 import json
-import sys
-import shutil
+import numpy as np
 import argparse
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
 from contextlib import nullcontext
 
-import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
@@ -39,10 +37,9 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=11)
+parser.add_argument("--num-epochs", type=int, default=22)
 parser.add_argument("--patience", type=int, default=-1)
-parser.add_argument("--run-name", type=str, default=None,
-                    help="Run name under runs/ (default: random 6-char string)")
+parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=1.3)
@@ -57,7 +54,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--dupe-start-epoch", type=int, default=7,
+parser.add_argument("--dupe-start-epoch", type=int, default=14,
                     help="Epoch to enable layer duplication")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
@@ -69,7 +66,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio (default 0.2)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
-parser.add_argument("--logit-avg", type=int, default=3,
+parser.add_argument("--logit-avg", type=int, default=11,
                     help="Number of late checkpoints for logit (probability) averaging (0=disabled)")
 parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
                     help="Directory to save/load epoch checkpoints for logit averaging")
@@ -78,7 +75,7 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
-parser.add_argument("--swa-last-epochs", type=int, default=3,
+parser.add_argument("--swa-last-epochs", type=int, default=8,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
@@ -90,9 +87,10 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
-parser.add_argument("--no-doc-shuffle", action="store_true",
-                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
+parser.add_argument("--window-schedule", type=str, default="1-6:256,768;7-13:768,1792;14-22:1280,2048",
+                    help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
 args = parser.parse_args()
+args.window_schedule_spec = args.window_schedule.strip()
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -112,8 +110,6 @@ WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
-BOS_ID = 50256  # <|endoftext|>
-RUNS_DIR = "runs"
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -139,6 +135,69 @@ WD_SWA_LOW_FACTOR = 0.65  # WD at start of each SWA epoch (LR is high → less r
 WD_SWA_HIGH_FACTOR = 1.50 # WD at end of each SWA epoch (LR has decayed → more regularization)
 LOGIT_CAP = args.logit_cap
 
+
+@dataclass(frozen=True)
+class WindowScheduleStage:
+    start_epoch: int
+    end_epoch: int
+    short_window: int
+    long_window: int
+
+
+def parse_window_schedule(spec, max_seq_len):
+    if not spec:
+        return ()
+    stages = []
+    prev_end = 0
+    for raw_stage in spec.split(";"):
+        raw_stage = raw_stage.strip()
+        if not raw_stage:
+            continue
+        if ":" not in raw_stage:
+            raise ValueError(f"Invalid --window-schedule stage '{raw_stage}': expected 'start-end:short,long'")
+        epoch_part, window_part = raw_stage.split(":", 1)
+        epoch_part = epoch_part.strip()
+        window_part = window_part.strip()
+        if "-" in epoch_part:
+            start_raw, end_raw = epoch_part.split("-", 1)
+        else:
+            start_raw = epoch_part
+            end_raw = epoch_part
+        if "," not in window_part:
+            raise ValueError(f"Invalid --window-schedule stage '{raw_stage}': expected 'short,long'")
+        short_raw, long_raw = window_part.split(",", 1)
+        start_epoch = int(start_raw)
+        end_epoch = int(end_raw)
+        short_window = int(short_raw)
+        long_window = int(long_raw)
+        if start_epoch <= 0 or end_epoch < start_epoch:
+            raise ValueError(f"Invalid epoch range '{epoch_part}' in --window-schedule")
+        if short_window <= 0 or long_window <= 0:
+            raise ValueError(f"Window sizes must be positive in --window-schedule, got {short_window},{long_window}")
+        if short_window > long_window:
+            raise ValueError(f"Short window must be <= long window in --window-schedule, got {short_window},{long_window}")
+        if long_window > max_seq_len:
+            raise ValueError(f"Long window must be <= sequence length ({max_seq_len}), got {long_window}")
+        if start_epoch != prev_end + 1:
+            raise ValueError("--window-schedule stages must be contiguous and start at epoch 1")
+        stages.append(WindowScheduleStage(start_epoch, end_epoch, short_window, long_window))
+        prev_end = end_epoch
+    return tuple(stages)
+
+
+def get_window_schedule_stage(schedule, epoch):
+    if not schedule:
+        return None
+    for stage in schedule:
+        if stage.start_epoch <= epoch <= stage.end_epoch:
+            return stage
+    if epoch > schedule[-1].end_epoch:
+        return schedule[-1]
+    raise ValueError(f"No --window-schedule stage covers epoch {epoch}")
+
+
+args.window_schedule = parse_window_schedule(args.window_schedule_spec, MAX_SEQ_LEN)
+
 # =============================================================================
 # Utilities
 # =============================================================================
@@ -156,27 +215,6 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
-
-class TeeStream:
-    """Save terminal output to file."""
-    def __init__(self, *streams):
-        self.streams = streams
-        self.encoding = getattr(streams[0], "encoding", "utf-8")
-    def write(self, data):
-        for stream in self.streams: stream.write(data)
-        return len(data)
-    def flush(self):
-        for stream in self.streams: stream.flush()
-    def isatty(self):
-        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
-    def fileno(self):
-        return self.streams[0].fileno()
-
-def resolve_run_dir(run_name):
-    if run_name:
-        return run_name, os.path.join(RUNS_DIR, run_name)
-    name = time.strftime('%Y%m%d_%H%M%S')
-    return name, os.path.join(RUNS_DIR, name)
 
 # =============================================================================
 def load_state_dict_into_model(model, state_dict):
@@ -204,9 +242,9 @@ def _load_fa3():
 
 _fa3 = _load_fa3()
 
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), softmax_scale=None):
     """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
-    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    return _fa3.flash_attn_func(q, k, v, causal=causal, softmax_scale=softmax_scale, window_size=window_size)
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
@@ -227,6 +265,7 @@ class GPTConfig:
     stoch_depth: float = 0.05
     use_iha: bool = False
     iha_mix_v: bool = True
+    use_window_schedule: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -239,6 +278,49 @@ def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
+
+
+class Yarn(nn.Module):
+    def __init__(self, head_dim, max_seq_len, base=10000):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        inv_freq = self._build_inv_freq(device=torch.device("meta"))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        cos = inv_freq.new_empty(1, max_seq_len, 1, head_dim // 2)
+        sin = inv_freq.new_empty(1, max_seq_len, 1, head_dim // 2)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.attn_scale = head_dim ** -0.5
+        self.reset()
+
+    def _build_inv_freq(self, device):
+        return 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device) / self.head_dim))
+
+    @torch.no_grad()
+    def reset(self):
+        self.inv_freq.copy_(self._build_inv_freq(device=self.inv_freq.device))
+        self._refresh_tables()
+        self.attn_scale = self.head_dim ** -0.5
+
+    @torch.no_grad()
+    def _refresh_tables(self):
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.inv_freq.device)
+        freqs = torch.outer(t, self.inv_freq)
+        self.cos.copy_(freqs.cos()[None, :, None, :].bfloat16())
+        self.sin.copy_(freqs.sin()[None, :, None, :].bfloat16())
+
+    @torch.no_grad()
+    def apply(self, old_window: int, new_window: int, alpha: int = 1, beta: int = 32):
+        if new_window <= old_window:
+            raise ValueError(f"YaRN window updates must expand context, got {old_window} -> {new_window}")
+        rotations = old_window * self.inv_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.inv_freq.mul_(scaling_factor + interpolation_weight * (1 - scaling_factor))
+        self._refresh_tables()
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
 
 class CausalSelfAttention(nn.Module):
@@ -259,9 +341,7 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # IHA: cross-head mixing matrices (Interleaved Head Attention)
-        # Mixing is fused into projection weights at forward time.
-        # Cost: [H,H]@[H,d*C] matmul is negligible vs the [B*T,C]@[C,H*d] projection.
+        # IHA: cross-head mixing matrices fused into projection weights at forward time.
         self.use_iha = config.use_iha
         if self.use_iha:
             self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
@@ -271,14 +351,12 @@ class CausalSelfAttention(nn.Module):
                 self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
 
     def _fuse_mix(self, weight, mix, H):
-        """Fuse mixing matrix into projection weight: W_fused[h] = sum_m mix[h,m]*W[m]."""
         d = self.head_dim
         return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
         B, T, C = x.size()
         if self.use_iha:
-            # Fuse mixing into weights then project — grad flows through mix params
             q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
             q = q.view(B, T, self.n_head, self.head_dim)
             k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
@@ -300,7 +378,16 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        fa_dtype = q.dtype
+        if fa_dtype not in (torch.float16, torch.bfloat16):
+            fa_dtype = torch.bfloat16
+        if q.dtype != fa_dtype:
+            q = q.to(dtype=fa_dtype)
+        if k.dtype != fa_dtype:
+            k = k.to(dtype=fa_dtype)
+        if v.dtype != fa_dtype:
+            v = v.to(dtype=fa_dtype)
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, softmax_scale=softmax_scale)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -326,16 +413,16 @@ class Block(nn.Module):
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
             x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
         else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
             x = x + self.mlp(norm(x))
         return x
 
@@ -344,7 +431,10 @@ class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
+        self.window_pattern = config.window_pattern.upper()
+        self.short_window = config.sequence_len // 2
+        self.long_window = config.sequence_len
+        self.window_sizes = self._compute_window_sizes(self.short_window, self.long_window)
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
@@ -362,9 +452,12 @@ class GPT(nn.Module):
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        if config.use_window_schedule:
+            self.yarn = Yarn(head_dim, self.rotary_seq_len)
+        else:
+            cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+            self.register_buffer("cos", cos, persistent=False)
+            self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
@@ -399,7 +492,6 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
-            # IHA: initialize mixing matrices to identity (baseline-equivalent)
             if block.attn.use_iha:
                 torch.nn.init.eye_(block.attn.q_mix)
                 torch.nn.init.eye_(block.attn.k_mix)
@@ -411,9 +503,12 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(proj.weight, -s, s)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.cos = cos
-        self.sin = sin
+        if self.config.use_window_schedule:
+            self.yarn.reset()
+        else:
+            cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+            self.cos = cos
+            self.sin = sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -425,16 +520,40 @@ class GPT(nn.Module):
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
         return cos[None, :, None, :], sin[None, :, None, :]
 
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        long_w, short_w = config.sequence_len, config.sequence_len // 2
+    def _compute_window_sizes(self, short_w, long_w):
         char_to_w = {"L": (long_w, 0), "S": (short_w, 0)}
-        sizes = [char_to_w[pattern[i % len(pattern)]] for i in range(config.n_layer)]
+        sizes = [char_to_w[self.window_pattern[i % len(self.window_pattern)]] for i in range(self.config.n_layer)]
         sizes[-1] = (long_w, 0)  # final layer always full context
         return sizes
 
+    @torch.no_grad()
+    def set_window_sizes(self, short_window, long_window, apply_yarn=False):
+        short_window = int(short_window)
+        long_window = int(long_window)
+        if short_window <= 0 or long_window <= 0 or short_window > long_window:
+            raise ValueError(f"Invalid active windows short={short_window}, long={long_window}")
+        if long_window > self.config.sequence_len:
+            raise ValueError(f"Long window must be <= sequence length ({self.config.sequence_len}), got {long_window}")
+        if apply_yarn and hasattr(self, "yarn") and long_window != self.long_window:
+            if long_window < self.long_window:
+                raise ValueError(f"Window schedule cannot shrink long context after start, got {self.long_window} -> {long_window}")
+            self.yarn.apply(self.long_window, long_window)
+        self.short_window = short_window
+        self.long_window = long_window
+        self.window_sizes = self._compute_window_sizes(short_window, long_window)
+
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def _get_cos_sin(self, seq_len):
+        if hasattr(self, "yarn"):
+            return self.yarn.cos[:, :seq_len], self.yarn.sin[:, :seq_len]
+        return self.cos[:, :seq_len], self.sin[:, :seq_len]
+
+    def _get_attention_softmax_scale(self):
+        if hasattr(self, "yarn"):
+            return self.yarn.attn_scale
+        return None
 
     def _avg_causal_attended_keys(self, window, seq_len):
         if window < 0 or window >= seq_len - 1:
@@ -456,15 +575,12 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate IHA mixing params (small H×H matrices) from large matrix params
         iha_params = []
         iha_param_ids = set()
-        all_blocks = list(self.transformer.h)
+        blocks_for_iha = list(self.transformer.h)
         if self.mtp_weight > 0:
-            all_blocks_for_iha = all_blocks + [self.mtp_block]
-        else:
-            all_blocks_for_iha = all_blocks
-        for block in all_blocks_for_iha:
+            blocks_for_iha = blocks_for_iha + [self.mtp_block]
+        for block in blocks_for_iha:
             if block.attn.use_iha:
                 iha_params.append(block.attn.q_mix)
                 iha_params.append(block.attn.k_mix)
@@ -473,8 +589,7 @@ class GPT(nn.Module):
                 if block.attn.iha_mix_v:
                     iha_params.append(block.attn.v_mix)
                     iha_param_ids.add(id(block.attn.v_mix))
-        all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
+        matrix_params = [p for p in list(self.transformer.h.parameters()) if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
         if self.mtp_weight > 0:
             mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters()) if id(p) not in iha_param_ids]
             matrix_params += mtp_params
@@ -493,10 +608,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
-        # IHA mixing matrices: use AdamW with dedicated or scalar-like LR
         if iha_params:
-            iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
-            param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr,
+                                     betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -509,7 +623,8 @@ class GPT(nn.Module):
 
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = self._get_cos_sin(T)
+        softmax_scale = self._get_attention_softmax_scale()
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -517,21 +632,22 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = self._get_cos_sin(T)
+        softmax_scale = self._get_attention_softmax_scale()
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
             encoder_outputs.append(x)
 
         # Decoder half
@@ -565,7 +681,7 @@ class GPT(nn.Module):
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_out = norm(self.mtp_block(combined, None, self._get_cos_sin(mT), (-1, -1), softmax_scale=softmax_scale))
         mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
@@ -759,78 +875,49 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Loads flat tokens , chunks into batches.
+    """Pre-tokenized dataloader. Yields (inputs, targets, epoch) forever."""
 
-    doc_shuffle=False: applies the stored default sequence permutation (bitwise match
-    with the old chunked pipeline), shuffles batch order each epoch.
-    doc_shuffle=True: reshuffles documents each epoch, re-chunks, re-shuffles sequences.
-
-    Always yields (x, y, epoch).
-    """
-
-    def __init__(self, filepath, B, T, device="cuda", doc_shuffle=False):
+    def __init__(self, filepath, B, T, device="cuda"):
         data = torch.load(filepath, weights_only=True)
         all_tokens = data["tokens"].long()
-        raw_doc_starts = data["doc_starts"].long()
-        bos_id = int(data["bos_id"])
-        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
+        sequence_size = T + 1
 
-        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
-        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
-        self.default_shuffle_seed = data["seq_shuffle_seed"]
+        # Reconstruct the old sequence ordering from flat tokens
+        num_seqs = len(all_tokens) // sequence_size
+        all_seqs = all_tokens[:num_seqs * sequence_size].view(num_seqs, sequence_size)
+        perm = np.random.RandomState(data["seq_shuffle_seed"]).permutation(num_seqs)
+        all_seqs = all_seqs[torch.from_numpy(perm)]  # (N, T+1)
 
+        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        self.rank = rank
-        self.world_size = world_size
-        self.device = device
-        self.B = B
-        self.T = T
-        self.seq_size = T + 1
-        self.doc_shuffle = doc_shuffle
-        self.epoch = 1
-        self._build_batches()
-
-    def _build_batches(self):
-        tokens = torch.cat(self.doc_tokens)
-        num_seqs = len(tokens) // self.seq_size
-        all_seqs = tokens[:num_seqs * self.seq_size].view(num_seqs, self.seq_size)
-        if self.doc_shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.epoch + 1000)
-            all_seqs = all_seqs[torch.randperm(num_seqs, generator=g)]
-        else:
-            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
-            all_seqs = all_seqs[torch.from_numpy(perm)]
-        seqs_per_step = self.B * self.world_size
+        seqs_per_step = B * world_size
         num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
-        self.rank_data = all_seqs[:, self.rank].contiguous()
+        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
+
+        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
         self.num_steps = num_steps
-        self.total_tokens = usable * self.T
+        self.total_tokens = usable * T  # trainable tokens across all ranks
+        self.device = device
         self.pos = 0
+        self.epoch = 1
 
     def __iter__(self):
         return self
 
-    def _next_epoch(self):
-        self.epoch += 1
-        print0(f"Starting epoch {self.epoch}")
-        if self.doc_shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            perm = torch.randperm(len(self.doc_tokens), generator=g)
-            self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
-            self._build_batches()
-        else:
-            self.pos = 0
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            self.rank_data = self.rank_data[torch.randperm(self.num_steps, generator=g)]
+    def _shuffle(self):
+        """Shuffle batch order for the new epoch, consistent across ranks."""
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        perm = torch.randperm(self.num_steps, generator=g)
+        self.rank_data = self.rank_data[perm]
 
     def __next__(self):
         if self.pos >= self.num_steps:
-            self._next_epoch()
+            self.pos = 0
+            self.epoch += 1
+            print0(f"Starting epoch {self.epoch}")
+            self._shuffle()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
@@ -973,29 +1060,9 @@ if _fa3 is not None:
 else:
     raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
 
-# Run / logging paths
-run_name, run_dir = resolve_run_dir(args.run_name)
-if dist.is_initialized():
-    shared = [run_name]
-    dist.broadcast_object_list(shared, src=0)
-    run_name = shared[0]
-    run_dir = os.path.join(RUNS_DIR, run_name)
-checkpoints_dir = os.path.join(run_dir, "checkpoints")
-terminal_log_path = os.path.join(run_dir, "terminal.log")
-stdout_orig = sys.stdout
-stderr_orig = sys.stderr
-artifacts_log_f = None
-result_path = os.path.join(run_dir, "result.json")
-if master_process:
-    os.makedirs(checkpoints_dir, exist_ok=True)
-    os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
-    shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
-    artifacts_log_f = open(terminal_log_path, "a", encoding="utf-8", buffering=1)
-    sys.stdout = TeeStream(sys.stdout, artifacts_log_f)
-    sys.stderr = TeeStream(sys.stderr, artifacts_log_f)
-
 # wandb
-_wandb_kwargs = {"project": "slowrun", "name": run_name, "dir": os.path.join(run_dir, "wandb")}
+run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
+_wandb_kwargs = {"project": "slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
@@ -1006,17 +1073,16 @@ if master_process:
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+print0(f"  iha={args.iha}, iha_lr={args.iha_lr}")
 print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
-print0(f"  run={run_name}")
-print0(f"  run_dir={run_dir}")
-if args.iha:
-    print0(f"  iha=True, iha_lr={args.iha_lr}")
+print0(f"  dropout={args.dropout}")
+if args.window_schedule:
+    print0(f"  window_schedule={args.window_schedule_spec}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -1036,11 +1102,19 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha)
+                   use_iha=args.iha,
+                   iha_mix_v=args.iha,
+                   use_window_schedule=bool(args.window_schedule))
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+
+active_window_stage = None
+if args.window_schedule:
+    active_window_stage = get_window_schedule_stage(args.window_schedule, 1)
+    model.set_window_sizes(active_window_stage.short_window, active_window_stage.long_window)
+    print0(f"Initial window stage: epoch {active_window_stage.start_epoch}-{active_window_stage.end_epoch} -> short={active_window_stage.short_window}, long={active_window_stage.long_window}")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -1061,7 +1135,7 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1239,6 +1313,20 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
 
         model.train()
+        if args.window_schedule:
+            new_stage = get_window_schedule_stage(args.window_schedule, epoch)
+            if new_stage != active_window_stage:
+                orig_model.set_window_sizes(new_stage.short_window, new_stage.long_window, apply_yarn=True)
+                active_window_stage = new_stage
+                num_flops_per_token = orig_model.estimate_flops()
+                timing_start_step = step + 4
+                print0(f"Updated window stage for epoch {epoch}: short={new_stage.short_window}, long={new_stage.long_window}, yarn_scale={orig_model._get_attention_softmax_scale():.6f}")
+                wandb_run.log({
+                    "step": step,
+                    "schedule/window_short": new_stage.short_window,
+                    "schedule/window_long": new_stage.long_window,
+                    "schedule/yarn_scale": orig_model._get_attention_softmax_scale(),
+                })
         # Update num_iterations estimate now that we know real steps per epoch
         # steps_per_epoch = step // current_epoch
         # num_iterations = steps_per_epoch * args.num_epochs
@@ -1304,19 +1392,21 @@ print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
-_result_out = args.save_result or result_path
-if master_process:
+if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "window_schedule": args.window_schedule_spec,
+        "window_short": orig_model.short_window,
+        "window_long": orig_model.long_window,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
-    with open(_result_out, "w") as f:
+    with open(args.save_result, "w") as f:
         json.dump(result, f, indent=2)
-    print0(f"Result saved to {_result_out}")
+    print0(f"Result saved to {args.save_result}")
 
 total_wall_time = time.time() - _script_start
 print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
@@ -1324,9 +1414,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-if artifacts_log_f is not None:
-    sys.stdout.flush()
-    sys.stderr.flush()
-    sys.stdout = stdout_orig
-    sys.stderr = stderr_orig
-    artifacts_log_f.close()

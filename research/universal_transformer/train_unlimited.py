@@ -3,7 +3,7 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 train.py
+    torchrun --standalone --nproc_per_node=8 research/universal_transformer/train_unlimited.py
 """
 
 import os
@@ -12,15 +12,12 @@ import gc
 import math
 import time
 import json
-import sys
-import shutil
 import argparse
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
 from contextlib import nullcontext
 
-import numpy as np
 import torch
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
@@ -31,42 +28,36 @@ from torch import Tensor
 import wandb
 import tiktoken
 
-_script_start = time.time()
+wallclock_start = time.time()
 
 # =============================================================================
 # CLI arguments
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=11)
+parser.add_argument("--device-batch-size", type=int, default=1)
+parser.add_argument("--num-epochs", type=int, default=12) 
 parser.add_argument("--patience", type=int, default=-1)
-parser.add_argument("--run-name", type=str, default=None,
-                    help="Run name under runs/ (default: random 6-char string)")
+parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
-parser.add_argument("--weight-decay", type=float, default=1.3)
-parser.add_argument("--total-batch-size", type=int, default=524288)
+parser.add_argument("--weight-decay", type=float, default=0.65)
+parser.add_argument("--total-batch-size", type=int, default=131072)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n_layer", type=int, default=30)
-parser.add_argument("--n_head", type=int, default=14)
-parser.add_argument("--n_embd", type=int, default=1792)
-parser.add_argument("--lr_multiplier", type=float, default=0.25)
+parser.add_argument("--n-layer-schedule", type=str, default="0:48",
+                    help="Comma-separated depth schedule in step:n_layer format, must start at step 0")
+parser.add_argument("--n_head", type=int, default=32)
+parser.add_argument("--n_embd", type=int, default=4096)
+parser.add_argument("--lr_multiplier", type=float, default=0.125)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--dupe-start-epoch", type=int, default=7,
-                    help="Epoch to enable layer duplication")
-parser.add_argument("--dupe-layers-start", type=int, default=15,
-                    help="First decoder layer to duplicate (inclusive)")
-parser.add_argument("--dupe-layers-end", type=int, default=21,
-                    help="Last decoder layer to duplicate (exclusive)")
-parser.add_argument("--dupe-loops", type=int, default=2,
-                    help="Number of extra replay passes through dupe layers")
+parser.add_argument("--stoch-depth", type=float, default=0.05,
+                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
-                    help="Override warmdown ratio (default 0.2)")
+                    help="Override warmdown ratio")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--logit-avg", type=int, default=3,
@@ -78,10 +69,6 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
-parser.add_argument("--swa-last-epochs", type=int, default=3,
-                    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
-parser.add_argument("--stoch-depth", type=float, default=0.05,
-                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--mtp-weight", type=float, default=0.3,
                     help="Multi-token prediction weight (0=off)")
 parser.add_argument("--iha", action="store_true", default=True,
@@ -90,9 +77,39 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
-parser.add_argument("--no-doc-shuffle", action="store_true",
-                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
 args = parser.parse_args()
+
+
+def parse_n_layer_schedule(spec): # Might be overly redundant with all the checks, but i can't justify removing it.
+    schedule = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid n-layer schedule entry '{item}'. Expected step:n_layer.")
+        step, n_layer = int(parts[0]), int(parts[1])
+        if step < 0:
+            raise ValueError(f"Invalid n-layer schedule step {step}. Steps must be non-negative.")
+        if n_layer <= 0 or n_layer % 2 != 0:
+            raise ValueError(f"Invalid n-layer value {n_layer}. Depth must be a positive even integer.")
+        if schedule and step <= schedule[-1][0]:
+            raise ValueError("n-layer schedule steps must be strictly increasing.")
+        if schedule and n_layer < schedule[-1][1]:
+            raise ValueError("n-layer schedule depths must be non-decreasing.")
+        schedule.append((step, n_layer))
+    if not schedule:
+        raise ValueError("n-layer schedule cannot be empty.")
+    if schedule[0][0] != 0:
+        raise ValueError("n-layer schedule must start at step 0.")
+    return schedule
+
+
+try:
+    N_LAYER_SCHEDULE = parse_n_layer_schedule(args.n_layer_schedule)
+except ValueError as exc:
+    parser.error(str(exc))
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -102,8 +119,9 @@ if args.output_json and not args.save_result:
 # Hardwired d12 (GPT-2 small) hyperparameters
 # =============================================================================
 
-# Architecture (defaults = d12 GPT-2 small)
-DEPTH = args.n_layer if args.n_layer is not None else 12
+# Architecture (defaults = d12 -> d24 schedule)
+MAX_DEPTH = N_LAYER_SCHEDULE[-1][1]
+INITIAL_DEPTH = N_LAYER_SCHEDULE[0][1]
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
@@ -112,8 +130,6 @@ WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
-BOS_ID = 50256  # <|endoftext|>
-RUNS_DIR = "runs"
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -133,10 +149,6 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio if args.warmdown_ratio is not None else 0.2
 FINAL_LR_FRAC = 0.0
-WARMDOWN_POWER = 0.5      # sqrt-shaped warmdown (stays ~41% higher at midpoint than linear)
-WD_PRE_HOLD_FRAC = 0.40   # hold at base WD for first 40% of training, then decay to LOW by SWA start
-WD_SWA_LOW_FACTOR = 0.65  # WD at start of each SWA epoch (LR is high → less regularization)
-WD_SWA_HIGH_FACTOR = 1.50 # WD at end of each SWA epoch (LR has decayed → more regularization)
 LOGIT_CAP = args.logit_cap
 
 # =============================================================================
@@ -156,27 +168,6 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
-
-class TeeStream:
-    """Save terminal output to file."""
-    def __init__(self, *streams):
-        self.streams = streams
-        self.encoding = getattr(streams[0], "encoding", "utf-8")
-    def write(self, data):
-        for stream in self.streams: stream.write(data)
-        return len(data)
-    def flush(self):
-        for stream in self.streams: stream.flush()
-    def isatty(self):
-        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
-    def fileno(self):
-        return self.streams[0].fileno()
-
-def resolve_run_dir(run_name):
-    if run_name:
-        return run_name, os.path.join(RUNS_DIR, run_name)
-    name = time.strftime('%Y%m%d_%H%M%S')
-    return name, os.path.join(RUNS_DIR, name)
 
 # =============================================================================
 def load_state_dict_into_model(model, state_dict):
@@ -218,7 +209,8 @@ flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 class GPTConfig:
     sequence_len: int = MAX_SEQ_LEN
     vocab_size: int = 50257
-    n_layer: int = DEPTH
+    n_layer: int = MAX_DEPTH
+    initial_n_layer: int = INITIAL_DEPTH
     n_head: int = N_HEAD
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
@@ -228,7 +220,17 @@ class GPTConfig:
     use_iha: bool = False
     iha_mix_v: bool = True
 
-def norm(x):
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        y = F.rms_norm(x, (x.size(-1),), self.weight.to(dtype=x.dtype))
+        return y + self.bias.to(dtype=x.dtype)
+
+def rms_norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 def has_ve(layer_idx, n_layer):
@@ -241,8 +243,8 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+class SharedCausalSelfAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
@@ -254,14 +256,6 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-        # Attention gate: per-head gating to enable context-based no-op
-        self.attn_gate_channels = 12
-        self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # IHA: cross-head mixing matrices (Interleaved Head Attention)
-        # Mixing is fused into projection weights at forward time.
-        # Cost: [H,H]@[H,d*C] matmul is negligible vs the [B*T,C]@[C,H*d] projection.
         self.use_iha = config.use_iha
         if self.use_iha:
             self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
@@ -270,15 +264,13 @@ class CausalSelfAttention(nn.Module):
             if self.iha_mix_v:
                 self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
 
-    def _fuse_mix(self, weight, mix, H):
-        """Fuse mixing matrix into projection weight: W_fused[h] = sum_m mix[h,m]*W[m]."""
+    def _fuse_mix(self, weight, mix, num_heads):
         d = self.head_dim
-        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
+        return (mix @ weight.view(num_heads, d, -1).flatten(1)).view_as(weight)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, q_norm, k_norm, ve_gate=None, attn_gate=None):
         B, T, C = x.size()
         if self.use_iha:
-            # Fuse mixing into weights then project — grad flows through mix params
             q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
             q = q.view(B, T, self.n_head, self.head_dim)
             k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
@@ -295,21 +287,21 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
+            assert ve_gate is not None
+            v = v + (2 * torch.sigmoid(ve_gate)).unsqueeze(-1) * ve
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
+        q, k = q_norm(q), k_norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        # Attention gate: per-head sigmoid gate
-        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
+        if attn_gate is not None:
+            y = y * torch.sigmoid(attn_gate).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
 
-class MLP(nn.Module):
+class SharedMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden = 256 * ((8 * config.n_embd // 3 + 255) // 256)
+        hidden = 8 * config.n_embd
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
@@ -318,39 +310,47 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
-class Block(nn.Module):
+class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-        # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
+        self.attn_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(2)])
+        self.mlp_norm = RMSNorm(config.n_embd)
+        head_dim = config.n_embd // config.n_head
+        self.q_norms = nn.ModuleList([RMSNorm(head_dim) for _ in range(2)])
+        self.k_norms = nn.ModuleList([RMSNorm(head_dim) for _ in range(2)])
+        self.ve_gate_channels = 32
+        self.attn_gate_channels = 12
+        has_value_embed = has_ve(layer_idx, config.n_layer)
+        self.ve_gates = nn.ModuleList([
+            nn.Linear(self.ve_gate_channels, config.n_kv_head, bias=False) if has_value_embed else nn.Identity()
+            for _ in range(2)
+        ])
+        self.attn_gates = nn.ModuleList([
+            nn.Linear(self.attn_gate_channels, config.n_head, bias=False) for _ in range(2)
+        ])
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
-
-    def forward(self, x, ve, cos_sin, window_size):
-        # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
-        if self.training and self.drop_prob > 0:
-            keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
-            x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
-            x = x_in + keep * (x - x_in)
-        else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
-        return x
 
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
+        assert config.n_layer % 2 == 0, "n_layer must be even"
+        assert config.initial_n_layer % 2 == 0, "initial_n_layer must be even"
+        assert 0 < config.initial_n_layer <= config.n_layer
+        self.max_n_layer = config.n_layer
+        self.max_encoder_layers = config.n_layer // 2
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
+        self.encoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
+        self.decoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
+        self.encoder_mlp = SharedMLP(config)
+        self.decoder_mlp = SharedMLP(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([LayerBlock(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -359,61 +359,61 @@ class GPT(nn.Module):
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
-        self.encoder_layers = config.n_layer // 2
-        self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
+        self.skip_weights = nn.Parameter(torch.ones(self.max_encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
-        self._dupe_layers = None  # (start, end) or None
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
-            self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
-            self.mtp_block = Block(config, config.n_layer)
-
-    def set_dupe_layers(self, start, end, loops=2):
-        assert start >= self.encoder_layers, "dupe layers must be decoder-only"
-        assert end <= self.config.n_layer
-        self._dupe_layers = (start, end)
-        self._dupe_loops = loops
-        print0(f"Dupe layers {start}-{end-1}: {loops} extra replays ({loops+1} total passes)")
+            self.mtp_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.set_active_layers(config.initial_n_layer)
 
     @torch.no_grad()
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        normal_std = self.config.n_embd ** -0.5
-        all_blocks = list(self.transformer.h)
         if self.mtp_weight > 0:
-            all_blocks.append(self.mtp_block)
-            torch.nn.init.uniform_(self.mtp_proj.weight, -s, s)
-        for block in all_blocks:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
-            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn.attn_gate.weight)
-            # IHA: initialize mixing matrices to identity (baseline-equivalent)
-            if block.attn.use_iha:
-                torch.nn.init.eye_(block.attn.q_mix)
-                torch.nn.init.eye_(block.attn.k_mix)
-                if block.attn.iha_mix_v:
-                    torch.nn.init.eye_(block.attn.v_mix)
+            torch.nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.001)
+        for attn in [*self.encoder_attns, *self.decoder_attns]:
+            torch.nn.init.uniform_(attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(attn.c_proj.weight)
+            if attn.use_iha:
+                torch.nn.init.eye_(attn.q_mix)
+                torch.nn.init.eye_(attn.k_mix)
+                if attn.iha_mix_v:
+                    torch.nn.init.eye_(attn.v_mix)
+        for mlp in (self.encoder_mlp, self.decoder_mlp):
+            torch.nn.init.uniform_(mlp.c_gate.weight, -s, s)
+            torch.nn.init.uniform_(mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
+        for block in self.transformer.h:
+            for attn_norm in block.attn_norms:
+                attn_norm.weight.fill_(1.0)
+                attn_norm.bias.zero_()
+            block.mlp_norm.weight.fill_(1.0)
+            block.mlp_norm.bias.zero_()
+            for q_norm, k_norm in zip(block.q_norms, block.k_norms):
+                q_norm.weight.fill_(1.0)
+                q_norm.bias.zero_()
+                k_norm.weight.fill_(1.0)
+                k_norm.bias.zero_()
+            for ve_gate in block.ve_gates:
+                if isinstance(ve_gate, nn.Linear):
+                    torch.nn.init.zeros_(ve_gate.weight)
+            for attn_gate in block.attn_gates:
+                torch.nn.init.zeros_(attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.cos = cos
-        self.sin = sin
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -436,51 +436,81 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def set_active_layers(self, n_layer):
+        assert n_layer % 2 == 0, "active n_layer must be even"
+        assert 0 < n_layer <= self.max_n_layer, "active n_layer must be within (0, max_n_layer]"
+        self.active_n_layer = n_layer
+        self.active_encoder_layers = n_layer // 2
+        self.active_decoder_start = self.max_n_layer - self.active_encoder_layers
+
     def _avg_causal_attended_keys(self, window, seq_len):
         if window < 0 or window >= seq_len - 1:
             return (seq_len + 1) / 2
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self):
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embedding lookup + elementwise scalars
-        nparams_exclude = (self.transformer.wte.weight.numel()
-                          + self.resid_lambdas.numel()
-                          + self.x0_lambdas.numel()
-                          + self.skip_weights.numel())
+    def estimate_flops(self): 
+        # Counts effective params (recursion counted as multiple) which should be more accurate.
+        # But not sure if the 6x multiplier still makes sense in this case.
+        shared_attn = sum(p.numel() for p in self.encoder_attns.parameters()) + sum(p.numel() for p in self.decoder_attns.parameters())
+        shared_mlp = sum(p.numel() for p in self.encoder_mlp.parameters()) + sum(p.numel() for p in self.decoder_mlp.parameters())
+        active_layers = list(range(self.active_encoder_layers)) + list(range(self.active_decoder_start, self.max_n_layer))
+        nparams = (
+            self.transformer.wte.weight.numel()
+            + self.lm_head.weight.numel()
+            + self.active_encoder_layers * (shared_attn + shared_mlp)
+            + sum(p.numel() for i in active_layers for p in self.transformer.h[i].parameters())
+            + sum(p.numel() for i in active_layers if str(i) in self.ve_projs for p in self.ve_projs[str(i)].parameters())
+            + 3 * self.active_encoder_layers
+        )
+        nparams_exclude = self.transformer.wte.weight.numel() + 3 * self.active_encoder_layers
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        attn_flops = sum(
+            12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
+            for i in range(self.active_encoder_layers)
+        ) + sum(
+            12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
+            for i in range(self.active_decoder_start, self.max_n_layer)
+        )
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate IHA mixing params (small H×H matrices) from large matrix params
         iha_params = []
         iha_param_ids = set()
-        all_blocks = list(self.transformer.h)
-        if self.mtp_weight > 0:
-            all_blocks_for_iha = all_blocks + [self.mtp_block]
-        else:
-            all_blocks_for_iha = all_blocks
-        for block in all_blocks_for_iha:
-            if block.attn.use_iha:
-                iha_params.append(block.attn.q_mix)
-                iha_params.append(block.attn.k_mix)
-                iha_param_ids.add(id(block.attn.q_mix))
-                iha_param_ids.add(id(block.attn.k_mix))
-                if block.attn.iha_mix_v:
-                    iha_params.append(block.attn.v_mix)
-                    iha_param_ids.add(id(block.attn.v_mix))
-        all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
-        if self.mtp_weight > 0:
-            mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters()) if id(p) not in iha_param_ids]
-            matrix_params += mtp_params
+        for attn in [*self.encoder_attns, *self.decoder_attns]:
+            if attn.use_iha:
+                iha_params.append(attn.q_mix)
+                iha_params.append(attn.k_mix)
+                iha_param_ids.add(id(attn.q_mix))
+                iha_param_ids.add(id(attn.k_mix))
+                if attn.iha_mix_v:
+                    iha_params.append(attn.v_mix)
+                    iha_param_ids.add(id(attn.v_mix))
+        shared_params = (
+            list(self.encoder_attns.parameters())
+            + list(self.decoder_attns.parameters())
+            + list(self.encoder_mlp.parameters())
+            + list(self.decoder_mlp.parameters())
+        )
+        layer_matrix_params = []
+        norm_params = []
+        for block in self.transformer.h:
+            for attn_gate in block.attn_gates:
+                layer_matrix_params.append(attn_gate.weight)
+            norm_params.extend(block.attn_norms.parameters())
+            norm_params.extend(block.mlp_norm.parameters())
+            norm_params.extend(block.q_norms.parameters())
+            norm_params.extend(block.k_norms.parameters())
+            for ve_gate in block.ve_gates:
+                if isinstance(ve_gate, nn.Linear):
+                    layer_matrix_params.append(ve_gate.weight)
+        matrix_params = [p for p in shared_params if id(p) not in iha_param_ids] + layer_matrix_params + list(self.ve_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        if self.mtp_weight > 0:
+            lm_head_params += list(self.mtp_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
@@ -489,14 +519,13 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=norm_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
-        # IHA mixing matrices: use AdamW with dedicated or scalar-like LR
         if iha_params:
-            iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
-            param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -507,51 +536,55 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
+    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attns, shared_mlp):
+        block = self.transformer.h[layer_idx]
+        x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
+        ve = self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
+        x_in = x
+        for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
+            shared_attns, block.attn_norms, block.q_norms, block.k_norms, block.ve_gates, block.attn_gates
+        ):
+            attn_input = attn_norm(x)
+            ve_gate_out = ve_gate(attn_input[..., :block.ve_gate_channels]) if isinstance(ve_gate, nn.Linear) else None
+            attn_gate_out = attn_gate(attn_input[..., :block.attn_gate_channels])
+            x = x + attn(
+                attn_input, ve, cos_sin, self.window_sizes[layer_idx], q_norm, k_norm,
+                ve_gate=ve_gate_out, attn_gate=attn_gate_out
+            )
+        mlp_input = block.mlp_norm(x)
+        x = x + shared_mlp(mlp_input)
+        if self.training and block.drop_prob > 0:
+            keep = (torch.rand((), device=x.device) >= block.drop_prob).to(x.dtype)
+            x = x_in + keep * (x - x_in)
+        return x
+
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
-            j = self.config.n_layer - 1 - i
-            if 0 <= j < self.encoder_layers:
-                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            j = self.max_n_layer - 1 - i
+            if 0 <= j < len(encoder_outputs):
+                x = x + self.skip_weights[i - self.max_encoder_layers] * encoder_outputs[j]
+            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attns, self.decoder_mlp)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
-        x = norm(self.transformer.wte(idx))
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = rms_norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
-        for i in range(self.encoder_layers):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+        for i in range(self.active_encoder_layers):
+            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attns, self.encoder_mlp)
             encoder_outputs.append(x)
 
         # Decoder half
-        dupe = self._dupe_layers
-        if dupe is None:
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer, T)
-        else:
-            # First pass: encoder boundary through end of dupe range
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, dupe[1], T)
-            # Extra replays through dupe range
-            for _ in range(self._dupe_loops):
-                x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                            dupe[0], dupe[1], T)
-            # Remaining decoder layers
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        dupe[1], self.config.n_layer, T)
+        x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                     self.active_decoder_start, self.max_n_layer)
 
-        x = norm(x)
+        x = rms_norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
         if targets is None:
@@ -562,11 +595,7 @@ class GPT(nn.Module):
             return lm_loss
         if self.mtp_weight <= 0:
             return lm_loss, {'lm_loss': lm_loss}
-        mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
-        combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
-        mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
-        mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
+        mtp_logits = self.mtp_head(x[:, :-1])[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
         mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
@@ -602,8 +631,6 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # MuonEq-R row normalization
-    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -651,8 +678,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _reduce_adamw(self, group, world_size):
         infos = {}
+        active_params = []
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
+            active_params.append(p)
             if p.numel() < 1024:
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
@@ -662,10 +693,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 grad_slice = torch.empty_like(grad[:rank_size])
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
-        return dict(param_infos=infos)
+        return dict(param_infos=infos, params=active_params)
 
     def _reduce_muon(self, group, world_size):
-        params = group['params']
+        params = [p for p in group['params'] if p.grad is not None]
+        if not params:
+            return dict(params=[], chunk_size=0)
         chunk_size = (len(params) + world_size - 1) // world_size
         padded = chunk_size * world_size
         p = params[0]
@@ -676,10 +709,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
             stacked_grads[len(params):].zero_()
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size, params=params)
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        for p in group['params']:
+        for p in info['params']:
             pinfo = info['param_infos'][p]
             pinfo['future'].wait()
             state = self.state[p]
@@ -707,18 +740,20 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group, info, gather_list, rank):
+        if not info['params']:
+            return
         info['future'].wait()
-        params = group['params']
+        params = info['params']
         chunk_size = info['chunk_size']
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
         state = self.state[p]
-        if "momentum_buffer" not in state:
+        if "momentum_buffer" not in state or state["momentum_buffer"].shape != (chunk_size, *shape):
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            s = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+        s = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+        if "second_momentum_buffer" not in state or state["second_momentum_buffer"].shape != s:
             state["second_momentum_buffer"] = torch.zeros(s, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -759,78 +794,53 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Loads flat tokens , chunks into batches.
+    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
 
-    doc_shuffle=False: applies the stored default sequence permutation (bitwise match
-    with the old chunked pipeline), shuffles batch order each epoch.
-    doc_shuffle=True: reshuffles documents each epoch, re-chunks, re-shuffles sequences.
-
-    Always yields (x, y, epoch).
-    """
-
-    def __init__(self, filepath, B, T, device="cuda", doc_shuffle=False):
+    def __init__(self, filepath, B, T, device="cuda"):
         data = torch.load(filepath, weights_only=True)
-        all_tokens = data["tokens"].long()
-        raw_doc_starts = data["doc_starts"].long()
-        bos_id = int(data["bos_id"])
-        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
+        chunks = data['chunks']
+        valid_counts = data['valid_counts']
+        file_B = data['batch_size']
+        sequence_size = data['sequence_size']
+        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
 
-        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
-        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
-        self.default_shuffle_seed = data["seq_shuffle_seed"]
+        # Gather all valid sequences into one tensor
+        all_seqs = []
+        for chunk, vc in zip(chunks, valid_counts):
+            rows = chunk.view(file_B, sequence_size)[:vc]
+            all_seqs.append(rows)
+        all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
 
+        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        self.rank = rank
-        self.world_size = world_size
-        self.device = device
-        self.B = B
-        self.T = T
-        self.seq_size = T + 1
-        self.doc_shuffle = doc_shuffle
-        self.epoch = 1
-        self._build_batches()
-
-    def _build_batches(self):
-        tokens = torch.cat(self.doc_tokens)
-        num_seqs = len(tokens) // self.seq_size
-        all_seqs = tokens[:num_seqs * self.seq_size].view(num_seqs, self.seq_size)
-        if self.doc_shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.epoch + 1000)
-            all_seqs = all_seqs[torch.randperm(num_seqs, generator=g)]
-        else:
-            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
-            all_seqs = all_seqs[torch.from_numpy(perm)]
-        seqs_per_step = self.B * self.world_size
+        seqs_per_step = B * world_size
         num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
-        self.rank_data = all_seqs[:, self.rank].contiguous()
+        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
+
+        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
         self.num_steps = num_steps
-        self.total_tokens = usable * self.T
+        self.total_tokens = usable * T  # trainable tokens across all ranks
+        self.device = device
         self.pos = 0
+        self.epoch = 1
 
     def __iter__(self):
         return self
 
-    def _next_epoch(self):
-        self.epoch += 1
-        print0(f"Starting epoch {self.epoch}")
-        if self.doc_shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            perm = torch.randperm(len(self.doc_tokens), generator=g)
-            self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
-            self._build_batches()
-        else:
-            self.pos = 0
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            self.rank_data = self.rank_data[torch.randperm(self.num_steps, generator=g)]
+    def _shuffle(self):
+        """Shuffle batch order for the new epoch, consistent across ranks."""
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        perm = torch.randperm(self.num_steps, generator=g)
+        self.rank_data = self.rank_data[perm]
 
     def __next__(self):
         if self.pos >= self.num_steps:
-            self._next_epoch()
+            self.pos = 0
+            self.epoch += 1
+            print0(f"Starting epoch {self.epoch}")
+            self._shuffle()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
@@ -895,8 +905,10 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
     batch_target_probs = torch.zeros(steps, BT, dtype=torch.float32, device=dev)
 
     # Checkpoint-outer, batch-inner: each checkpoint loaded exactly once
+    restore_n_layer = orig_model.active_n_layer
     for path, w in zip(ckpt_paths, weights):
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        orig_model.set_active_layers(ckpt.pop("active_n_layer", restore_n_layer))
         load_state_dict_into_model(orig_model, ckpt)
         del ckpt
         for i, (x, y) in enumerate(zip(all_x, all_y)):
@@ -925,6 +937,7 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
         total_tokens += mask.sum()
 
     del batch_target_probs
+    orig_model.set_active_layers(restore_n_layer)
 
     if dist.is_initialized():
         dist.all_reduce(total_nats,   op=dist.ReduceOp.SUM)
@@ -973,29 +986,9 @@ if _fa3 is not None:
 else:
     raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
 
-# Run / logging paths
-run_name, run_dir = resolve_run_dir(args.run_name)
-if dist.is_initialized():
-    shared = [run_name]
-    dist.broadcast_object_list(shared, src=0)
-    run_name = shared[0]
-    run_dir = os.path.join(RUNS_DIR, run_name)
-checkpoints_dir = os.path.join(run_dir, "checkpoints")
-terminal_log_path = os.path.join(run_dir, "terminal.log")
-stdout_orig = sys.stdout
-stderr_orig = sys.stderr
-artifacts_log_f = None
-result_path = os.path.join(run_dir, "result.json")
-if master_process:
-    os.makedirs(checkpoints_dir, exist_ok=True)
-    os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
-    shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
-    artifacts_log_f = open(terminal_log_path, "a", encoding="utf-8", buffering=1)
-    sys.stdout = TeeStream(sys.stdout, artifacts_log_f)
-    sys.stderr = TeeStream(sys.stderr, artifacts_log_f)
-
 # wandb
-_wandb_kwargs = {"project": "slowrun", "name": run_name, "dir": os.path.join(run_dir, "wandb")}
+run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
+_wandb_kwargs = {"project": "slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
@@ -1004,17 +997,16 @@ if master_process:
 
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
-print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
+print0(f"  n_layer_schedule={args.n_layer_schedule}, max_n_layer={MAX_DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
-print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
-print0(f"  run={run_name}")
-print0(f"  run_dir={run_dir}")
+print0(f"  dropout={args.dropout}")
+print0(f"  stoch_depth={args.stoch_depth}")
+print0(f"  mtp_weight={args.mtp_weight}")
 if args.iha:
     print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
@@ -1043,25 +1035,28 @@ model.to_empty(device=device)
 model.init_weights()
 
 param_counts = sum(p.numel() for p in model.parameters())
-transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
+transformer_params = (
+    sum(p.numel() for p in model.transformer.h.parameters())
+    + sum(p.numel() for p in model.encoder_attns.parameters())
+    + sum(p.numel() for p in model.decoder_attns.parameters())
+    + sum(p.numel() for p in model.encoder_mlp.parameters())
+    + sum(p.numel() for p in model.decoder_mlp.parameters())
+)
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
 num_flops_per_token = model.estimate_flops()
 print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
-print0(f"FLOPs per token: {num_flops_per_token:e}")
+print0(f"Initial FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
 orig_model = model
 model = torch.compile(model, dynamic=False)
 
-# Optimizer
-optimizer = model.setup_optimizer()
-
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1075,6 +1070,38 @@ print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps}
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
+
+def precompile_schedule_depths(sample_x, sample_y):
+    warmup_depths = sorted({n_layer for _, n_layer in N_LAYER_SCHEDULE})
+    warmup_optimizer = orig_model.setup_optimizer()
+    for n_layer in warmup_depths:
+        orig_model.set_active_layers(n_layer)
+        orig_model.train()
+        with autocast_ctx:
+            loss = model(sample_x, sample_y)
+            if isinstance(loss, tuple):
+                loss = loss[0]
+        loss.backward()
+        warmup_optimizer.step()
+        model.zero_grad(set_to_none=True)
+        orig_model.eval()
+        with autocast_ctx:
+            _ = model(sample_x, sample_y, loss_reduction='none')
+        model.zero_grad(set_to_none=True)
+    del warmup_optimizer
+    orig_model.init_weights()
+    orig_model.set_active_layers(INITIAL_DEPTH)
+    model.zero_grad(set_to_none=True)
+    orig_model.train()
+
+
+precompile_schedule_depths(x, y)
+
+# Optimizer
+optimizer = orig_model.setup_optimizer()
+if device_type == "cuda":
+    torch.cuda.reset_peak_memory_stats(device)
+
 # Schedulers
 def get_lr_multiplier(it):
     warmup = round(WARMUP_RATIO * num_iterations)
@@ -1083,40 +1110,22 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown: return 1.0
     else:
         progress = (num_iterations - it) / warmdown
-        shaped = progress ** WARMDOWN_POWER  # concave (stays higher longer) when POWER < 1
-        return shaped + (1 - shaped) * FINAL_LR_FRAC
+        return progress + (1 - progress) * FINAL_LR_FRAC
 
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
-steps_per_epoch = num_iterations / args.num_epochs
-_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
-
-def get_wd_multiplier(it):
-    """Anti-phase WD: hold at 1.0 pre-SWA, decay to LOW by SWA start, then sawtooth LOW→HIGH per SWA epoch (anti-phase with the LR cosine cycle)."""
-    if _swa_start_step >= 0 and it >= _swa_start_step:
-        cycle_pos = (it - _swa_start_step) % steps_per_epoch
-        frac = cycle_pos / steps_per_epoch
-        return WD_SWA_LOW_FACTOR + (WD_SWA_HIGH_FACTOR - WD_SWA_LOW_FACTOR) * frac
-    t = it / num_iterations
-    if t < WD_PRE_HOLD_FRAC:
-        return 1.0
-    swa_start_frac = _swa_start_step / num_iterations if _swa_start_step > 0 else 1.0
-    decay_frac = (t - WD_PRE_HOLD_FRAC) / max(swa_start_frac - WD_PRE_HOLD_FRAC, 1e-6)
-    decay_frac = min(max(decay_frac, 0.0), 1.0)
-    return 1.0 - (1.0 - WD_SWA_LOW_FACTOR) * decay_frac
-
 # Training loop
 step = 0
+layer_schedule_idx = 0
+val_bpb = float("inf")
+val_loss = float("inf")
 min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
-timed_steps = 0
-timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
-dupe_active = False
 
 late_checkpoint_paths = []  # paths to saved epoch checkpoints for logit averaging
 logit_avg_count = args.logit_avg
@@ -1124,6 +1133,8 @@ if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
 if logit_avg_count > 0:
     print0(f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/")
+
+wandb_run.log({"step": 0, "model/n_layer": orig_model.active_n_layer})
 
 if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
@@ -1140,40 +1151,23 @@ else:
     model.train()
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
-    if not dupe_active and current_epoch >= args.dupe_start_epoch:
-        print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
-        orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
-        model = torch.compile(orig_model, dynamic=False)
-        # model = orig_model # replace compile with this line for eager mode
-        dupe_active = True
-        timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
-        gc.enable(); gc.collect()
-
     # Training step
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss, metrics = model(x, y)
+            loss = model(x, y)
+            metrics = None
+            if isinstance(loss, tuple):
+                loss, metrics = loss
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
-    # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
-    if _swa_start_step >= 0 and step >= _swa_start_step:
-        cycle_pos = (step - _swa_start_step) % steps_per_epoch
-        swa_base = max(lrm, 0.05)
-        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
-    # WD schedule: pre-SWA decay from base to 0.65×base, then anti-phase sawtooth
-    # during SWA's N epochs (0.65→1.50×base per epoch, anti-phase with LR cosine cycle).
-    wdm = get_wd_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if "initial_wd" not in group:
-            group["initial_wd"] = group.get("weight_decay", 0.0)
-        group["weight_decay"] = group["initial_wd"] * wdm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
@@ -1191,20 +1185,21 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
-    if step >= timing_start_step:
-        total_training_time += dt
-        timed_steps += 1
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
-    dupe_str = " [DUPE]" if dupe_active else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
-                   **{f"train/{k}": v.item() for k, v in metrics.items()}})
+    total_training_time += dt
+    eta_str = f" | eta: {(num_iterations - step) * total_training_time / step / 60:.1f}m"
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    log_data = {"step": step, "train/loss": debiased, "train/mfu": mfu}
+    if metrics is not None:
+        log_data.update({f"train/{k}": v.item() for k, v in metrics.items()})
+    wandb_run.log(log_data)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
         epoch_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
         dist.all_reduce(epoch_tensor, op=dist.ReduceOp.MAX)
         epoch = epoch_tensor.item()
+
+    grow_now = layer_schedule_idx + 1 < len(N_LAYER_SCHEDULE) and step >= N_LAYER_SCHEDULE[layer_schedule_idx + 1][0]
 
     # Epoch boundary: evaluate when the dataloader advances to a new epoch
     if epoch != current_epoch:
@@ -1229,6 +1224,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             ckpt_path = os.path.join(args.logit_avg_dir, f"epoch_{current_epoch:03d}.pt")
             if master_process:
                 ckpt = {name: p.data.float().cpu() for name, p in orig_model.named_parameters()}
+                ckpt["active_n_layer"] = orig_model.active_n_layer
                 torch.save(ckpt, ckpt_path)
                 del ckpt
             late_checkpoint_paths.append(ckpt_path)
@@ -1244,6 +1240,18 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         # num_iterations = steps_per_epoch * args.num_epochs
         # print0(f"Epoch {current_epoch} took {steps_per_epoch} steps. Updated estimate: {num_iterations} total steps.")
         current_epoch = epoch
+        if grow_now:
+            layer_schedule_idx += 1
+            orig_model.set_active_layers(N_LAYER_SCHEDULE[layer_schedule_idx][1])
+            num_flops_per_token = orig_model.estimate_flops()
+            print0(f"Step {step:05d} | n_layer -> {orig_model.active_n_layer}")
+            wandb_run.log({"step": step, "model/n_layer": orig_model.active_n_layer})
+    elif grow_now:
+        layer_schedule_idx += 1
+        orig_model.set_active_layers(N_LAYER_SCHEDULE[layer_schedule_idx][1])
+        num_flops_per_token = orig_model.estimate_flops()
+        print0(f"Step {step:05d} | n_layer -> {orig_model.active_n_layer}")
+        wandb_run.log({"step": step, "model/n_layer": orig_model.active_n_layer})
 
     # GC management
     if step == 1:
@@ -1267,7 +1275,7 @@ if logit_avg_count > 0:
         n = len(ckpt_paths_for_logit)
         print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
 
-        la_model = torch.compile(orig_model, dynamic=False)
+        la_model = model
         la_model.eval()
 
         def _run_mode(label, weights):
@@ -1304,8 +1312,7 @@ print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
-_result_out = args.save_result or result_path
-if master_process:
+if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
@@ -1314,19 +1321,13 @@ if master_process:
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
-    with open(_result_out, "w") as f:
+    with open(args.save_result, "w") as f:
         json.dump(result, f, indent=2)
-    print0(f"Result saved to {_result_out}")
+    print0(f"Result saved to {args.save_result}")
 
-total_wall_time = time.time() - _script_start
+total_wall_time = time.time() - wallclock_start
 print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-if artifacts_log_f is not None:
-    sys.stdout.flush()
-    sys.stderr.flush()
-    sys.stdout = stdout_orig
-    sys.stderr = stderr_orig
-    artifacts_log_f.close()
