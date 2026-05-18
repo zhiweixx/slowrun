@@ -92,11 +92,55 @@ parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
+parser.add_argument("--mask-token-id", type=int, default=50257,
+                    help="Token id to use for masked diffaux inputs; must be an unused padded embedding id")
+parser.add_argument("--adaptive-stage0-epochs", type=int, default=0,
+                    help="Epochs of normal training before enabling diffaux stage 1")
+parser.add_argument("--adaptive-stage1-epochs", type=int, default=None,
+                    help="Epochs of stage-1 diffaux training (default: num_epochs - adaptive_stage0_epochs)")
+parser.add_argument("--stage1-full-seq", action="store_true", default=True,
+                    help="Use full-sequence causal CE for the stage-1 auxiliary loss (only supported mode)")
+parser.add_argument("--ntp-loss-downscale", type=float, default=1.0,
+                    help="Multiplier for the normal next-token/MTP loss")
+parser.add_argument("--adaptive-loss-downscale", type=float, default=0.4,
+                    help="Multiplier for the stage-1 diffaux auxiliary LM-only loss")
+parser.add_argument("--stage1-mask-sampling", type=str, default="uniform_ratio",
+                    choices=("uniform_ratio",),
+                    help="Mask sampling mode for stage-1 diffaux (only uniform_ratio is supported)")
+parser.add_argument("--stage1-mask-ratio-min", type=float, default=0.0,
+                    help="Minimum per-sequence stage-1 mask ratio")
+parser.add_argument("--stage1-mask-ratio-max", type=float, default=0.5,
+                    help="Maximum per-sequence stage-1 mask ratio")
+parser.add_argument("--ltr-length", type=int, default=8,
+                    help="Left-to-right prefix length excluded from stage-1 mask sampling")
 args = parser.parse_args()
 
 # Resolve output path
 if args.output_json and not args.save_result:
     args.save_result = args.output_json
+
+if args.adaptive_stage1_epochs is None:
+    args.adaptive_stage1_epochs = args.num_epochs - args.adaptive_stage0_epochs
+if not (0 <= args.adaptive_stage0_epochs <= args.num_epochs):
+    raise ValueError("--adaptive-stage0-epochs must be in [0, num-epochs]")
+if args.adaptive_stage1_epochs < 0:
+    raise ValueError("--adaptive-stage1-epochs must be non-negative")
+if args.adaptive_stage0_epochs + args.adaptive_stage1_epochs > args.num_epochs:
+    raise ValueError("--adaptive-stage0-epochs + --adaptive-stage1-epochs must be <= num-epochs")
+if not args.stage1_full_seq:
+    raise ValueError("this slowrun diffaux port only supports --stage1-full-seq")
+if args.ltr_length < 1:
+    raise ValueError("--ltr-length must be at least 1")
+if not (0.0 <= args.stage1_mask_ratio_min <= 1.0):
+    raise ValueError("--stage1-mask-ratio-min must be in [0, 1]")
+if not (0.0 <= args.stage1_mask_ratio_max <= 1.0):
+    raise ValueError("--stage1-mask-ratio-max must be in [0, 1]")
+if args.stage1_mask_ratio_min > args.stage1_mask_ratio_max:
+    raise ValueError("--stage1-mask-ratio-min must be <= --stage1-mask-ratio-max")
+if not (0.0 <= args.ntp_loss_downscale <= 1.0):
+    raise ValueError("--ntp-loss-downscale must be in [0, 1]")
+if not (0.0 <= args.adaptive_loss_downscale <= 1.0):
+    raise ValueError("--adaptive-loss-downscale must be in [0, 1]")
 
 # =============================================================================
 # Hardwired d12 (GPT-2 small) hyperparameters
@@ -138,6 +182,13 @@ WD_PRE_HOLD_FRAC = 0.40   # hold at base WD for first 40% of training, then deca
 WD_SWA_LOW_FACTOR = 0.65  # WD at start of each SWA epoch (LR is high → less regularization)
 WD_SWA_HIGH_FACTOR = 1.50 # WD at end of each SWA epoch (LR has decayed → more regularization)
 LOGIT_CAP = args.logit_cap
+ADAPTIVE_STAGE0_EPOCHS = args.adaptive_stage0_epochs
+ADAPTIVE_STAGE1_EPOCHS = args.adaptive_stage1_epochs
+NTP_LOSS_DOWNSCALE = args.ntp_loss_downscale
+ADAPTIVE_LOSS_DOWNSCALE = args.adaptive_loss_downscale
+STAGE1_MASK_RATIO_MIN = args.stage1_mask_ratio_min
+STAGE1_MASK_RATIO_MAX = args.stage1_mask_ratio_max
+LTR_LENGTH = args.ltr_length
 
 # =============================================================================
 # Utilities
@@ -520,7 +571,7 @@ class GPT(nn.Module):
             x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
         return x
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', include_mtp=True):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
@@ -560,7 +611,7 @@ class GPT(nn.Module):
                                   ignore_index=-1, reduction=loss_reduction)
         if loss_reduction != 'mean':
             return lm_loss
-        if self.mtp_weight <= 0:
+        if self.mtp_weight <= 0 or not include_mtp:
             return lm_loss, {'lm_loss': lm_loss}
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
@@ -836,6 +887,47 @@ class DataLoader:
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
 
 # =============================================================================
+# Diffaux stage-1 full-sequence masker
+# =============================================================================
+
+class DiffAuxStage1Trainer:
+    """Build masked inputs for the full-sequence causal diffaux auxiliary loss."""
+
+    def __init__(self, mask_token_id, ltr_length, mask_ratio_min, mask_ratio_max, seed=1234):
+        self.mask_token_id = int(mask_token_id)
+        self.ltr_length = int(ltr_length)
+        self.mask_ratio_min = float(mask_ratio_min)
+        self.mask_ratio_max = float(mask_ratio_max)
+        self.rank = int(os.environ.get('RANK', 0))
+        self.cpu_gen = torch.Generator(device='cpu')
+        self.cpu_gen.manual_seed(seed + self.rank)
+
+    def enabled(self):
+        return self.mask_ratio_max > 0.0
+
+    def sample_mask_ratio(self):
+        if self.mask_ratio_min == self.mask_ratio_max:
+            return self.mask_ratio_min
+        unit = torch.rand((), generator=self.cpu_gen).item()
+        return self.mask_ratio_min + (self.mask_ratio_max - self.mask_ratio_min) * unit
+
+    def build_masked_input(self, x):
+        B, T = x.shape
+        target_lo = self.ltr_length
+        target_hi = T - 1
+        if target_lo > target_hi:
+            raise ValueError(f"cannot sample stage1 mask positions from [{target_lo}, {target_hi}] for T={T}")
+        available = target_hi - target_lo + 1
+        masked = x.clone()
+        for b in range(B):
+            mask_ratio = self.sample_mask_ratio()
+            sampled = torch.rand(available, generator=self.cpu_gen) < mask_ratio
+            if sampled.any():
+                positions = torch.nonzero(sampled, as_tuple=False).flatten().to(x.device) + target_lo
+                masked[b, positions] = self.mask_token_id
+        return masked
+
+# =============================================================================
 # Loss evaluation
 # =============================================================================
 
@@ -1013,6 +1105,16 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
+print0(
+    f"  diffaux: stage0_epochs={ADAPTIVE_STAGE0_EPOCHS}, "
+    f"stage1_epochs={ADAPTIVE_STAGE1_EPOCHS}, ntp_loss_downscale={NTP_LOSS_DOWNSCALE}, "
+    f"adaptive_loss_downscale={ADAPTIVE_LOSS_DOWNSCALE}"
+)
+print0(
+    f"  diffaux stage1: full_seq={args.stage1_full_seq}, "
+    f"mask_sampling={args.stage1_mask_sampling}, ratio=[{STAGE1_MASK_RATIO_MIN}, {STAGE1_MASK_RATIO_MAX}], "
+    f"ltr_length={LTR_LENGTH}"
+)
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 if args.iha:
@@ -1023,6 +1125,14 @@ print0(f"-----------------------")
 encoder = tiktoken.get_encoding("gpt2")
 vocab_size = encoder.n_vocab  # 50257
 print0(f"Vocab size: {vocab_size:,}")
+mask_token_id = int(args.mask_token_id)
+padded_vocab_size = ((vocab_size + 64 - 1) // 64) * 64
+if not (vocab_size <= mask_token_id < padded_vocab_size):
+    raise ValueError(
+        f"--mask-token-id must be an unused padded embedding id in "
+        f"[{vocab_size}, {padded_vocab_size - 1}], got {mask_token_id}"
+    )
+print0(f"Mask token id: {mask_token_id} (padded vocab size: {padded_vocab_size:,})")
 
 eot_id = encoder._special_tokens['<|endoftext|>']
 token_bytes_list = []
@@ -1065,6 +1175,12 @@ train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, devi
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
+diffaux_trainer = DiffAuxStage1Trainer(
+    mask_token_id=mask_token_id,
+    ltr_length=LTR_LENGTH,
+    mask_ratio_min=STAGE1_MASK_RATIO_MIN,
+    mask_ratio_max=STAGE1_MASK_RATIO_MAX,
+)
 
 # Training config
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
@@ -1152,11 +1268,38 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    weighted_loss_sum = 0.0
+    normal_loss_sum = 0.0
+    aux_loss_sum = 0.0
+    aux_loss_count = 0
+    diffaux_active_micro_steps = 0
+    metrics = {}
     for micro_step in range(grad_accum_steps):
+        epoch_progress = (step * TOTAL_BATCH_SIZE + micro_step * tokens_per_fwdbwd) / TOKENS_PER_EPOCH
+        stage1_active = (
+            epoch_progress >= ADAPTIVE_STAGE0_EPOCHS
+            and epoch_progress < ADAPTIVE_STAGE0_EPOCHS + ADAPTIVE_STAGE1_EPOCHS
+            and diffaux_trainer.enabled()
+            and ADAPTIVE_LOSS_DOWNSCALE > 0.0
+        )
         with autocast_ctx:
-            loss, metrics = model(x, y)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
+            normal_loss, metrics = model(x, y)
+        raw_normal_loss = normal_loss.detach().item()
+        normal_loss_sum += raw_normal_loss
+        weighted_loss_sum += NTP_LOSS_DOWNSCALE * raw_normal_loss
+        if NTP_LOSS_DOWNSCALE > 0.0:
+            (normal_loss * NTP_LOSS_DOWNSCALE / grad_accum_steps).backward()
+
+        if stage1_active:
+            diffaux_active_micro_steps += 1
+            masked_x = diffaux_trainer.build_masked_input(x)
+            with autocast_ctx:
+                aux_loss, _ = model(masked_x, y, include_mtp=False)
+            raw_aux_loss = aux_loss.detach().item()
+            aux_loss_sum += raw_aux_loss
+            aux_loss_count += 1
+            weighted_loss_sum += ADAPTIVE_LOSS_DOWNSCALE * raw_aux_loss
+            (aux_loss * ADAPTIVE_LOSS_DOWNSCALE / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
     # Update optimizer
@@ -1178,7 +1321,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item()
+    train_loss_f = weighted_loss_sum / grad_accum_steps
+    raw_normal_loss_avg = normal_loss_sum / grad_accum_steps
+    raw_aux_loss_avg = aux_loss_sum / aux_loss_count if aux_loss_count > 0 else None
     synchronize()
     dt = time.time() - t0
 
@@ -1196,9 +1341,20 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         timed_steps += 1
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
     dupe_str = " [DUPE]" if dupe_active else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
-                   **{f"train/{k}": v.item() for k, v in metrics.items()}})
+    aux_str = f" | aux: {raw_aux_loss_avg:.6f}" if raw_aux_loss_avg is not None else " | aux: off"
+    diffaux_str = f" | diffaux: {diffaux_active_micro_steps}/{grad_accum_steps}"
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | normal: {raw_normal_loss_avg:.6f}{aux_str}{diffaux_str} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
+    log_payload = {
+        "step": step,
+        "train/loss": debiased,
+        "train/mfu": mfu,
+        "train/raw_loss_normal": raw_normal_loss_avg,
+        "train/diffaux_active_frac": diffaux_active_micro_steps / grad_accum_steps,
+        **{f"train/{k}": v.item() for k, v in metrics.items()},
+    }
+    if raw_aux_loss_avg is not None:
+        log_payload["train/raw_loss_aux"] = raw_aux_loss_avg
+    wandb_run.log(log_payload)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1310,6 +1466,16 @@ if master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "adaptive_stage0_epochs": ADAPTIVE_STAGE0_EPOCHS,
+        "adaptive_stage1_epochs": ADAPTIVE_STAGE1_EPOCHS,
+        "stage1_full_seq": args.stage1_full_seq,
+        "stage1_mask_sampling": args.stage1_mask_sampling,
+        "stage1_mask_ratio_min": STAGE1_MASK_RATIO_MIN,
+        "stage1_mask_ratio_max": STAGE1_MASK_RATIO_MAX,
+        "ltr_length": LTR_LENGTH,
+        "mask_token_id": mask_token_id,
+        "ntp_loss_downscale": NTP_LOSS_DOWNSCALE,
+        "adaptive_loss_downscale": ADAPTIVE_LOSS_DOWNSCALE,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),

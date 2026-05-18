@@ -88,12 +88,56 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
+parser.add_argument("--mask-token-id", type=int, default=50257,
+                    help="Token id to use for masked diffaux inputs; must be an unused padded embedding id")
+parser.add_argument("--adaptive-stage0-epochs", type=int, default=0,
+                    help="Epochs of normal training before enabling diffaux stage 1")
+parser.add_argument("--adaptive-stage1-epochs", type=int, default=None,
+                    help="Epochs of stage-1 diffaux training per model (default: model_num_epochs - adaptive_stage0_epochs)")
+parser.add_argument("--stage1-full-seq", action="store_true", default=True,
+                    help="Use full-sequence causal CE for the stage-1 auxiliary loss (only supported mode)")
+parser.add_argument("--ntp-loss-downscale", type=float, default=1.0,
+                    help="Multiplier for the normal next-token/MTP or distillation loss")
+parser.add_argument("--adaptive-loss-downscale", type=float, default=0.4,
+                    help="Multiplier for the stage-1 diffaux auxiliary LM-only loss")
+parser.add_argument("--stage1-mask-sampling", type=str, default="uniform_ratio",
+                    choices=("uniform_ratio",),
+                    help="Mask sampling mode for stage-1 diffaux (only uniform_ratio is supported)")
+parser.add_argument("--stage1-mask-ratio-min", type=float, default=0.0,
+                    help="Minimum per-sequence stage-1 mask ratio")
+parser.add_argument("--stage1-mask-ratio-max", type=float, default=0.5,
+                    help="Maximum per-sequence stage-1 mask ratio")
+parser.add_argument("--ltr-length", type=int, default=8,
+                    help="Left-to-right prefix length excluded from stage-1 mask sampling")
 parser.add_argument("--max-models-in-memory", type=int, default=4,
                     help="Max ensemble models loaded per rank at once during ensemble eval")
 args = parser.parse_args()
 
 if args.output_json and not args.save_result:
     args.save_result = args.output_json
+
+_max_model_epochs = max(args.num_epochs_model_0 or args.num_epochs, args.num_epochs)
+if not (0 <= args.adaptive_stage0_epochs <= _max_model_epochs):
+    raise ValueError("--adaptive-stage0-epochs must be in [0, max model epochs]")
+if args.adaptive_stage1_epochs is not None and args.adaptive_stage1_epochs < 0:
+    raise ValueError("--adaptive-stage1-epochs must be non-negative")
+if (args.adaptive_stage1_epochs is not None and
+        args.adaptive_stage0_epochs + args.adaptive_stage1_epochs > _max_model_epochs):
+    raise ValueError("--adaptive-stage0-epochs + --adaptive-stage1-epochs must be <= max model epochs")
+if not args.stage1_full_seq:
+    raise ValueError("this unlimited diffaux port only supports --stage1-full-seq")
+if args.ltr_length < 1:
+    raise ValueError("--ltr-length must be at least 1")
+if not (0.0 <= args.stage1_mask_ratio_min <= 1.0):
+    raise ValueError("--stage1-mask-ratio-min must be in [0, 1]")
+if not (0.0 <= args.stage1_mask_ratio_max <= 1.0):
+    raise ValueError("--stage1-mask-ratio-max must be in [0, 1]")
+if args.stage1_mask_ratio_min > args.stage1_mask_ratio_max:
+    raise ValueError("--stage1-mask-ratio-min must be <= --stage1-mask-ratio-max")
+if not (0.0 <= args.ntp_loss_downscale <= 1.0):
+    raise ValueError("--ntp-loss-downscale must be in [0, 1]")
+if not (0.0 <= args.adaptive_loss_downscale <= 1.0):
+    raise ValueError("--adaptive-loss-downscale must be in [0, 1]")
 
 # =============================================================================
 # Hyperparameters
@@ -126,6 +170,14 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.2
 FINAL_LR_FRAC = 0.0
 LOGIT_CAP = 15.0
+MASK_TOKEN_ID = args.mask_token_id
+ADAPTIVE_STAGE0_EPOCHS = args.adaptive_stage0_epochs
+ADAPTIVE_STAGE1_EPOCHS = args.adaptive_stage1_epochs
+NTP_LOSS_DOWNSCALE = args.ntp_loss_downscale
+ADAPTIVE_LOSS_DOWNSCALE = args.adaptive_loss_downscale
+STAGE1_MASK_RATIO_MIN = args.stage1_mask_ratio_min
+STAGE1_MASK_RATIO_MAX = args.stage1_mask_ratio_max
+LTR_LENGTH = args.ltr_length
 
 # =============================================================================
 # Utilities
@@ -540,7 +592,7 @@ class GPT(nn.Module):
         return F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
                                targets[:, 1:].reshape(-1), ignore_index=-1)
 
-    def forward(self, idx, targets=None, loss_reduction='mean', distill=False):
+    def forward(self, idx, targets=None, loss_reduction='mean', distill=False, include_mtp=True):
         """
         If targets is None: returns primary logits.
         If targets is given and distill=True: returns (primary_logits, mtp_loss_tensor).
@@ -554,7 +606,7 @@ class GPT(nn.Module):
         if targets is None:
             return logits
         if distill:
-            if self.mtp_weight > 0:
+            if self.mtp_weight > 0 and include_mtp:
                 mtp_loss = self._mtp_loss(x, targets)
             else:
                 mtp_loss = torch.zeros((), device=logits.device, dtype=torch.float32)
@@ -563,7 +615,7 @@ class GPT(nn.Module):
                                   ignore_index=-1, reduction=loss_reduction)
         if loss_reduction != 'mean':
             return lm_loss
-        if self.mtp_weight <= 0:
+        if self.mtp_weight <= 0 or not include_mtp:
             return lm_loss, {'lm_loss': lm_loss}
         mtp_loss = self._mtp_loss(x, targets)
         loss = lm_loss + self.mtp_weight * mtp_loss
@@ -808,6 +860,48 @@ class DataLoader:
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
+
+
+# =============================================================================
+# Diffaux stage-1 full-sequence masker
+# =============================================================================
+
+class DiffAuxStage1Trainer:
+    """Build masked inputs for the full-sequence causal diffaux auxiliary loss."""
+
+    def __init__(self, mask_token_id, ltr_length, mask_ratio_min, mask_ratio_max, seed=1234):
+        self.mask_token_id = int(mask_token_id)
+        self.ltr_length = int(ltr_length)
+        self.mask_ratio_min = float(mask_ratio_min)
+        self.mask_ratio_max = float(mask_ratio_max)
+        self.rank = int(os.environ.get('RANK', 0))
+        self.cpu_gen = torch.Generator(device='cpu')
+        self.cpu_gen.manual_seed(seed + self.rank)
+
+    def enabled(self):
+        return self.mask_ratio_max > 0.0
+
+    def sample_mask_ratio(self):
+        if self.mask_ratio_min == self.mask_ratio_max:
+            return self.mask_ratio_min
+        unit = torch.rand((), generator=self.cpu_gen).item()
+        return self.mask_ratio_min + (self.mask_ratio_max - self.mask_ratio_min) * unit
+
+    def build_masked_input(self, x):
+        B, T = x.shape
+        target_lo = self.ltr_length
+        target_hi = T - 1
+        if target_lo > target_hi:
+            raise ValueError(f"cannot sample stage1 mask positions from [{target_lo}, {target_hi}] for T={T}")
+        available = target_hi - target_lo + 1
+        masked = x.clone()
+        for b in range(B):
+            mask_ratio = self.sample_mask_ratio()
+            sampled = torch.rand(available, generator=self.cpu_gen) < mask_ratio
+            if sampled.any():
+                positions = torch.nonzero(sampled, as_tuple=False).flatten().to(x.device) + target_lo
+                masked[b, positions] = self.mask_token_id
+        return masked
 
 
 class DDPValLoader:
@@ -1056,6 +1150,13 @@ def load_teacher_models(checkpoint_paths, config, device):
     return teachers
 
 
+def resolve_adaptive_stage1_epochs(num_epochs):
+    remaining = max(0, num_epochs - ADAPTIVE_STAGE0_EPOCHS)
+    if ADAPTIVE_STAGE1_EPOCHS is None:
+        return remaining
+    return min(ADAPTIVE_STAGE1_EPOCHS, remaining)
+
+
 # =============================================================================
 # Training one model
 # =============================================================================
@@ -1153,6 +1254,14 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
     train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, seed=seed)
     x, y, current_epoch = next(train_loader)
+    model_adaptive_stage1_epochs = resolve_adaptive_stage1_epochs(num_epochs)
+    diffaux_trainer = DiffAuxStage1Trainer(
+        mask_token_id=MASK_TOKEN_ID,
+        ltr_length=LTR_LENGTH,
+        mask_ratio_min=STAGE1_MASK_RATIO_MIN,
+        mask_ratio_max=STAGE1_MASK_RATIO_MAX,
+        seed=seed,
+    )
 
     # Training config
     normal_device_batch_size = args.device_batch_size
@@ -1169,6 +1278,12 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     print0(f"  [model {model_idx+1}] Grad accum steps: {grad_accum_steps} (normal), {dupe_grad_accum_steps} (dupe, models 1+)")
     TOKENS_PER_EPOCH = train_loader.total_tokens
     num_iterations = round(TOKENS_PER_EPOCH * num_epochs / TOTAL_BATCH_SIZE)
+    print0(
+        f"  [model {model_idx+1}] Diffaux: stage0_epochs={ADAPTIVE_STAGE0_EPOCHS}, "
+        f"stage1_epochs={model_adaptive_stage1_epochs}, ntp_loss_downscale={NTP_LOSS_DOWNSCALE}, "
+        f"adaptive_loss_downscale={ADAPTIVE_LOSS_DOWNSCALE}, "
+        f"mask_ratio=[{STAGE1_MASK_RATIO_MIN}, {STAGE1_MASK_RATIO_MAX}], ltr_length={LTR_LENGTH}"
+    )
 
     synchronize = torch.cuda.synchronize if device.type == "cuda" else lambda: None
 
@@ -1208,6 +1323,8 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     smooth_train_kl_loss = 0    # EMA for KL distillation component
     smooth_train_lm_loss = 0    # EMA for standard-path lm CE
     smooth_train_mtp_loss = 0   # EMA for MTP aux loss
+    smooth_train_normal_loss = 0
+    smooth_train_aux_loss = 0
     total_training_time = 0
     eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 
@@ -1249,7 +1366,20 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         train_kl_loss = None
         train_lm_loss = None
         train_mtp_loss = None
+        weighted_loss_sum = 0.0
+        normal_loss_sum = 0.0
+        aux_loss_sum = 0.0
+        aux_loss_count = 0
+        diffaux_active_micro_steps = 0
         for micro_step in range(grad_accum_steps):
+            tokens_per_micro_step = TOTAL_BATCH_SIZE // grad_accum_steps
+            epoch_progress = (step * TOTAL_BATCH_SIZE + micro_step * tokens_per_micro_step) / TOKENS_PER_EPOCH
+            stage1_active = (
+                epoch_progress >= ADAPTIVE_STAGE0_EPOCHS
+                and epoch_progress < ADAPTIVE_STAGE0_EPOCHS + model_adaptive_stage1_epochs
+                and diffaux_trainer.enabled()
+                and ADAPTIVE_LOSS_DOWNSCALE > 0.0
+            )
             if teacher_models:
                 # --- Chain distillation loss (MTP folded into the "normal loss") ---
                 with torch.inference_mode():
@@ -1294,8 +1424,22 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
                 if mtp_on and 'mtp_loss' in metrics:
                     train_mtp_loss = metrics['mtp_loss'].detach()
 
-            train_loss = loss.detach()
-            (loss / grad_accum_steps).backward()
+            raw_normal_loss = loss.detach().item()
+            normal_loss_sum += raw_normal_loss
+            weighted_loss_sum += NTP_LOSS_DOWNSCALE * raw_normal_loss
+            if NTP_LOSS_DOWNSCALE > 0.0:
+                (loss * NTP_LOSS_DOWNSCALE / grad_accum_steps).backward()
+
+            if stage1_active:
+                diffaux_active_micro_steps += 1
+                masked_x = diffaux_trainer.build_masked_input(x)
+                with autocast_ctx:
+                    aux_loss, _ = compiled_model(masked_x, y, include_mtp=False)
+                raw_aux_loss = aux_loss.detach().item()
+                aux_loss_sum += raw_aux_loss
+                aux_loss_count += 1
+                weighted_loss_sum += ADAPTIVE_LOSS_DOWNSCALE * raw_aux_loss
+                (aux_loss * ADAPTIVE_LOSS_DOWNSCALE / grad_accum_steps).backward()
             x, y, epoch = next(train_loader)
 
         lrm = get_lr_multiplier(step)
@@ -1306,7 +1450,9 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']], max_norm=1.0)
         optimizer.step()
         compiled_model.zero_grad(set_to_none=True)
-        train_loss_f = train_loss.item()
+        train_loss_f = weighted_loss_sum / grad_accum_steps
+        raw_normal_loss_avg = normal_loss_sum / grad_accum_steps
+        raw_aux_loss_avg = aux_loss_sum / aux_loss_count if aux_loss_count > 0 else None
         synchronize()
         dt = time.time() - t0
         toks_per_sec = TOTAL_BATCH_SIZE / dt
@@ -1330,15 +1476,32 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         if step > 10:
             total_training_time += dt
         dupe_str = " [DUPE]" if dupe_active else ""
+        aux_str = f" | aux: {raw_aux_loss_avg:.6f}" if raw_aux_loss_avg is not None else " | aux: off"
+        diffaux_str = f" | diffaux: {diffaux_active_micro_steps}/{grad_accum_steps}"
         if step % 50 == 0 or step == 1:
-            print0(f"  [model {model_idx+1}] step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | {toks_per_sec:.0f} tok/s{dupe_str}")
+            print0(
+                f"  [model {model_idx+1}] step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} "
+                f"| normal: {raw_normal_loss_avg:.6f}{aux_str}{diffaux_str} | {toks_per_sec:.0f} tok/s{dupe_str}"
+            )
 
         log_dict = {
             "step": step,
             f"model_{model_idx+1}/train_loss": debiased,
             "model_idx": model_idx,
             "tokens_per_sec": toks_per_sec,
+            f"model_{model_idx+1}/raw_loss_normal": raw_normal_loss_avg,
+            f"model_{model_idx+1}/diffaux_active_frac": diffaux_active_micro_steps / grad_accum_steps,
         }
+        if raw_aux_loss_avg is not None:
+            log_dict[f"model_{model_idx+1}/raw_loss_aux"] = raw_aux_loss_avg
+
+        smooth_train_normal_loss = ema_beta * smooth_train_normal_loss + (1 - ema_beta) * raw_normal_loss_avg
+        debiased_normal = smooth_train_normal_loss / (1 - ema_beta**step)
+        log_dict[f"model_{model_idx+1}/train_normal_loss"] = debiased_normal
+        if raw_aux_loss_avg is not None:
+            smooth_train_aux_loss = ema_beta * smooth_train_aux_loss + (1 - ema_beta) * raw_aux_loss_avg
+            debiased_aux = smooth_train_aux_loss / (1 - ema_beta**step)
+            log_dict[f"model_{model_idx+1}/train_aux_loss"] = debiased_aux
 
         # Log decomposed distillation train losses when teacher is present
         if train_hard_loss is not None:
@@ -1548,6 +1711,12 @@ def main():
     # Tokenizer + token_bytes
     encoder = tiktoken.get_encoding("gpt2")
     vocab_size = encoder.n_vocab
+    padded_vocab_size = ((vocab_size + 64 - 1) // 64) * 64
+    if not (vocab_size <= MASK_TOKEN_ID < padded_vocab_size):
+        raise ValueError(
+            f"--mask-token-id must be an unused padded embedding id in "
+            f"[{vocab_size}, {padded_vocab_size - 1}], got {MASK_TOKEN_ID}"
+        )
     eot_id = encoder._special_tokens['<|endoftext|>']
     token_bytes_list = []
     for i in range(vocab_size):
@@ -1571,6 +1740,16 @@ def main():
     print0(f"  dupe_layers={args.dupe_layers_start}-{args.dupe_layers_end} (last {100*(1-args.dupe_fraction):.0f}% of epochs)")
     print0(f"  ema_decays={args.ema_decays}, ema_start_frac={args.ema_start_frac}")
     print0(f"  mtp_weight={args.mtp_weight}, iha={args.iha}, iha_lr={args.iha_lr}")
+    print0(
+        f"  diffaux: stage0_epochs={ADAPTIVE_STAGE0_EPOCHS}, "
+        f"stage1_epochs={'per-model remaining' if ADAPTIVE_STAGE1_EPOCHS is None else ADAPTIVE_STAGE1_EPOCHS}, "
+        f"ntp_loss_downscale={NTP_LOSS_DOWNSCALE}, adaptive_loss_downscale={ADAPTIVE_LOSS_DOWNSCALE}"
+    )
+    print0(
+        f"  diffaux stage1: full_seq={args.stage1_full_seq}, "
+        f"mask_sampling={args.stage1_mask_sampling}, ratio=[{STAGE1_MASK_RATIO_MIN}, {STAGE1_MASK_RATIO_MAX}], "
+        f"ltr_length={LTR_LENGTH}, mask_token_id={MASK_TOKEN_ID}, padded_vocab_size={padded_vocab_size}"
+    )
     print0(f"  checkpoint_dir={checkpoint_dir}")
     print0(f"{'='*60}")
 
@@ -1687,6 +1866,16 @@ def main():
         result = {
             "individual_models": individual_results,
             "ensemble_results": ensemble_results,
+            "adaptive_stage0_epochs": ADAPTIVE_STAGE0_EPOCHS,
+            "adaptive_stage1_epochs": ADAPTIVE_STAGE1_EPOCHS,
+            "stage1_full_seq": args.stage1_full_seq,
+            "stage1_mask_sampling": args.stage1_mask_sampling,
+            "stage1_mask_ratio_min": STAGE1_MASK_RATIO_MIN,
+            "stage1_mask_ratio_max": STAGE1_MASK_RATIO_MAX,
+            "ltr_length": LTR_LENGTH,
+            "mask_token_id": MASK_TOKEN_ID,
+            "ntp_loss_downscale": NTP_LOSS_DOWNSCALE,
+            "adaptive_loss_downscale": ADAPTIVE_LOSS_DOWNSCALE,
         }
         if ensemble_results:
             result["final_ensemble_bpb"] = ensemble_results[-1]["ensemble_bpb"]
